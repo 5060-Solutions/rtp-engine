@@ -1,0 +1,116 @@
+[package]
+name = "rtp-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["5060 Solutions <josh@5060solutions.com>"]
+description = "A pure Rust RTP media engine with codecs, SRTP, and audio device abstraction"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/5060-Solutions/rtp-engine"
+documentation = "https://docs.rs/rtp-engine"
+readme = "README.md"
+keywords = ["rtp", "rtcp", "voip", "audio", "srtp"]
+categories = ["multimedia::audio", "network-programming"]
+
+[lints.rust]
+# Deny all warnings - fail build on any warning
+warnings = "deny"
+# Unsafe code is forbidden
+unsafe_code = "deny"
+# Missing docs
+missing_docs = "warn"
+
+[lints.clippy]
+# Pedantic clippy lints (set priority -1 so individual lints can override)
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow common patterns that don't indicate bugs
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+# Allow const fn flexibility (const propagation happens anyway)
+missing_const_for_fn = "allow"
+# Allow integer casts in codec math (intentional bit manipulation)
+cast_sign_loss = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+# Allow default numeric fallback
+default_numeric_fallback = "allow"
+# Allow cognitive complexity for codec algorithms
+cognitive_complexity = "allow"
+# Allow too many lines in functions for test setup
+too_many_lines = "allow"
+# Allow multiple return paths in control flow
+option_if_let_else = "allow"
+# Allow else-if without else
+else_if_without_else = "allow"
+# Allow non-inlined format args (stylistic)
+uninlined_format_args = "allow"
+# Allow partial Debug impls (intentional for opaque types)
+missing_fields_in_debug = "allow"
+# Allow large enum variant size differences
+large_enum_variant = "allow"
+# Allow struct field reordering suggestions
+struct_field_names = "allow"
+# Allow unreadable literal hex patterns
+unreadable_literal = "allow"
+# Allow manual let-else (match is clearer in some contexts)
+manual_let_else = "allow"
+# Allow return Self without must_use
+return_self_not_must_use = "allow"
+# Allow unnecessary wraps for API consistency
+unnecessary_wraps = "allow"
+# Allow many arguments for internal functions
+too_many_arguments = "allow"
+# Allow redundant closures for clarity
+redundant_closure = "allow"
+# Allow manual range contains for clarity
+manual_range_contains = "allow"
+# Allow needless pass by value in some contexts
+needless_pass_by_value = "allow"
+# Allow significant drop in scrutinee
+significant_drop_in_scrutinee = "allow"
+# Allow significant drop tightening
+significant_drop_tightening = "allow"
+# Allow underscore-prefixed bindings that are used (conditional compilation)
+used_underscore_binding = "allow"
+
+[features]
+default = ["g711", "opus", "srtp", "device"]
+g711 = []
+opus = ["dep:audiopus"]
+srtp = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1"]
+device = ["dep:cpal"]
+
+[dependencies]
+# Core
+log = "0.4"
+thiserror = "2.0"
+
+# RTP/RTCP
+rand = "0.10"
+
+# Audio device (optional)
+cpal = { version = "0.17", optional = true }
+
+# Opus codec (optional)
+audiopus = { version = "0.3.0-rc.0", optional = true }
+
+# SRTP (optional)
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+base64 = "0.22"
+
+# Async runtime for device threads
+tokio = { version = "1", features = ["net", "time", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "macros"] }
+env_logger = "0.11"

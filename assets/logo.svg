@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="waveGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#e94560"/>
+      <stop offset="50%" style="stop-color:#f39422"/>
+      <stop offset="100%" style="stop-color:#e94560"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f3460"/>
+      <stop offset="100%" style="stop-color:#533483"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="100" cy="100" r="95" fill="url(#bgGrad)" stroke="#e94560" stroke-width="2"/>
+  
+  <!-- Inner ring -->
+  <circle cx="100" cy="100" r="75" fill="none" stroke="url(#accentGrad)" stroke-width="3" opacity="0.6"/>
+  
+  <!-- Audio waveform / RTP packets visualization -->
+  <g filter="url(#glow)">
+    <!-- Central packet stream -->
+    <rect x="45" y="95" width="12" height="10" rx="2" fill="url(#waveGrad)" opacity="0.9"/>
+    <rect x="62" y="88" width="12" height="24" rx="2" fill="url(#waveGrad)"/>
+    <rect x="79" y="80" width="12" height="40" rx="2" fill="url(#waveGrad)"/>
+    <rect x="96" y="72" width="12" height="56" rx="2" fill="url(#waveGrad)"/>
+    <rect x="113" y="80" width="12" height="40" rx="2" fill="url(#waveGrad)"/>
+    <rect x="130" y="88" width="12" height="24" rx="2" fill="url(#waveGrad)"/>
+    <rect x="147" y="95" width="12" height="10" rx="2" fill="url(#waveGrad)" opacity="0.9"/>
+  </g>
+  
+  <!-- Network arrows -->
+  <g stroke="#e94560" stroke-width="2" fill="none" opacity="0.7">
+    <path d="M30 100 L45 100" marker-end="url(#arrowhead)"/>
+    <path d="M159 100 L174 100"/>
+  </g>
+  
+  <!-- Arrow markers -->
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#e94560"/>
+    </marker>
+  </defs>
+  
+  <!-- Encryption lock icon -->
+  <g transform="translate(88, 140)">
+    <rect x="0" y="8" width="24" height="18" rx="3" fill="#533483" stroke="#e94560" stroke-width="1.5"/>
+    <path d="M5 8 V5 C5 1 19 1 19 5 V8" fill="none" stroke="#e94560" stroke-width="2"/>
+    <circle cx="12" cy="17" r="3" fill="#e94560"/>
+  </g>
+  
+  <!-- RTP text -->
+  <text x="100" y="55" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="18" font-weight="700" fill="#fff" letter-spacing="4">RTP</text>
+</svg>
