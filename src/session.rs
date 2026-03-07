@@ -341,7 +341,14 @@ fn run_audio_tx(
     let codec_rate = 8000u32;
     let resample_ratio = codec_rate as f64 / native_rate as f64;
 
-    let rt = tokio::runtime::Handle::current();
+    // Create a multi-threaded runtime for async UDP sends from audio callback
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| Error::device(format!("Failed to create TX runtime: {}", e)))?;
+    let rt_handle = rt.handle().clone();
+
     let seq = Arc::new(AtomicU16::new(0));
     let ts = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let pt = encoder.payload_type();
@@ -360,6 +367,7 @@ fn run_audio_tx(
     let cb_socket = socket.clone();
     let cb_learned = learned_remote.clone();
     let cb_counters = counters.clone();
+    let cb_rt = rt_handle.clone();
     #[cfg(feature = "srtp")]
     let cb_srtp = _srtp.clone();
 
@@ -423,7 +431,7 @@ fn run_audio_tx(
 
                     let dest = cb_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
                     let socket = cb_socket.clone();
-                    rt.spawn(async move {
+                    cb_rt.spawn(async move {
                         let _ = socket.send_to(&send_packet, dest).await;
                     });
                 }
@@ -547,6 +555,7 @@ fn run_audio_tx(
     }
 
     drop(stream);
+    drop(rt);  // Shutdown the TX runtime after stream is done
     Ok(())
 }
 
