@@ -11,11 +11,11 @@ use tokio::net::UdpSocket;
 use crate::codec::{AudioDecoder, AudioEncoder, CodecType, create_decoder, create_encoder};
 use crate::error::{Error, Result};
 use crate::recorder::{CallRecorder, RecorderHandle};
-use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
-use crate::rtp::{
-    RtpCounters, RtpHeader, RtpStats, build_rtcp_rr, build_rtcp_sr, parse_rtp, parse_sequence,
-    parse_timestamp,
-};
+#[cfg(feature = "device")]
+use crate::resample::{StreamResampler, f32_to_i16, i16_to_f32, resample_linear};
+use crate::rtp::{RtpCounters, RtpHeader, RtpStats, build_rtcp_rr, build_rtcp_sr};
+#[cfg(feature = "device")]
+use crate::rtp::{parse_rtp, parse_sequence, parse_timestamp};
 
 #[cfg(feature = "srtp")]
 use crate::srtp::SrtpContext;
@@ -47,6 +47,9 @@ pub struct MediaSession {
     recorder: Arc<std::sync::Mutex<Option<CallRecorder>>>,
     tx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
+    /// Conference mode flag - when enabled, audio from this session
+    /// participates in multi-party mixing
+    conference_mode: Arc<AtomicBool>,
 }
 
 impl MediaSession {
@@ -113,10 +116,13 @@ impl MediaSession {
         remote_addr: SocketAddr,
         codec_type: CodecType,
     ) -> Result<Self> {
-        Self::start_internal(local_rtp_port, remote_addr, codec_type, None).await
+        Self::start_internal(local_rtp_port, remote_addr, codec_type, None, None).await
     }
 
-    /// Start a media session with SRTP encryption.
+    /// Start a media session with SRTP encryption (single key for both directions).
+    ///
+    /// Note: For SDES key exchange where each party has their own key, use
+    /// `start_with_srtp_keys` instead.
     #[cfg(feature = "srtp")]
     pub async fn start_with_srtp(
         local_rtp_port: u16,
@@ -124,14 +130,45 @@ impl MediaSession {
         codec_type: CodecType,
         srtp_ctx: SrtpContext,
     ) -> Result<Self> {
-        Self::start_internal(local_rtp_port, remote_addr, codec_type, Some(srtp_ctx)).await
+        Self::start_internal(
+            local_rtp_port,
+            remote_addr,
+            codec_type,
+            Some(srtp_ctx),
+            None,
+        )
+        .await
+    }
+
+    /// Start a media session with SRTP using separate keys for TX and RX.
+    ///
+    /// In SDES key exchange (RFC 4568), each party generates their own key:
+    /// - `tx_srtp_ctx`: Our key (from our SDP offer) for encrypting outgoing packets
+    /// - `rx_srtp_ctx`: Their key (from their SDP answer) for decrypting incoming packets
+    #[cfg(feature = "srtp")]
+    pub async fn start_with_srtp_keys(
+        local_rtp_port: u16,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        tx_srtp_ctx: SrtpContext,
+        rx_srtp_ctx: SrtpContext,
+    ) -> Result<Self> {
+        Self::start_internal(
+            local_rtp_port,
+            remote_addr,
+            codec_type,
+            Some(tx_srtp_ctx),
+            Some(rx_srtp_ctx),
+        )
+        .await
     }
 
     async fn start_internal(
         local_rtp_port: u16,
         remote_addr: SocketAddr,
         codec_type: CodecType,
-        #[allow(unused_variables)] srtp_ctx: Option<SrtpContext>,
+        #[allow(unused_variables)] tx_srtp_ctx: Option<SrtpContext>,
+        #[allow(unused_variables)] rx_srtp_ctx: Option<SrtpContext>,
     ) -> Result<Self> {
         let rtp_socket = UdpSocket::bind(format!("0.0.0.0:{}", local_rtp_port))
             .await
@@ -154,11 +191,30 @@ impl MediaSession {
         let encoder = create_encoder(codec_type)?;
         let decoder = create_decoder(codec_type)?;
 
+        // SRTP contexts: TX for outgoing (protect), RX for incoming (unprotect)
+        // If only tx_srtp_ctx is provided, use it for both directions (symmetric mode)
         #[cfg(feature = "srtp")]
-        let shared_srtp: Option<SharedSrtp> =
-            srtp_ctx.map(|ctx| Arc::new(std::sync::Mutex::new(ctx)));
+        let (tx_srtp, rx_srtp): (Option<SharedSrtp>, Option<SharedSrtp>) =
+            match (tx_srtp_ctx, rx_srtp_ctx) {
+                (Some(tx), Some(rx)) => {
+                    log::info!("MediaSession: SRTP enabled with separate TX and RX contexts");
+                    (
+                        Some(Arc::new(std::sync::Mutex::new(tx))),
+                        Some(Arc::new(std::sync::Mutex::new(rx))),
+                    )
+                }
+                (Some(tx), None) => {
+                    log::info!("MediaSession: SRTP enabled with symmetric mode (shared context)");
+                    let shared = Arc::new(std::sync::Mutex::new(tx));
+                    (Some(shared.clone()), Some(shared))
+                }
+                _ => {
+                    log::info!("MediaSession: No SRTP - using plain RTP");
+                    (None, None)
+                }
+            };
         #[cfg(not(feature = "srtp"))]
-        let shared_srtp: Option<SharedSrtp> = None;
+        let (tx_srtp, rx_srtp): (Option<SharedSrtp>, Option<SharedSrtp>) = (None, None);
 
         // RTCP socket (RTP port + 1)
         let rtcp_port = local_rtp_port + 1;
@@ -179,7 +235,7 @@ impl MediaSession {
             let tx_running = running.clone();
             let tx_counters = counters.clone();
             let tx_learned = learned_remote.clone();
-            let tx_srtp = shared_srtp.clone();
+            let tx_srtp_ctx = tx_srtp.clone();
             let tx_recorder = tx_recorder_handle.clone();
 
             std::thread::spawn(move || {
@@ -192,7 +248,7 @@ impl MediaSession {
                     encoder,
                     tx_counters,
                     tx_learned,
-                    tx_srtp,
+                    tx_srtp_ctx,
                     tx_recorder,
                 ) {
                     log::error!("Audio TX error: {}", e);
@@ -207,7 +263,7 @@ impl MediaSession {
             let rx_running = running.clone();
             let rx_counters = counters.clone();
             let rx_learned = learned_remote.clone();
-            let rx_srtp = shared_srtp.clone();
+            let rx_srtp_ctx = rx_srtp.clone();
             let rx_recorder = rx_recorder_handle.clone();
 
             std::thread::spawn(move || {
@@ -217,7 +273,7 @@ impl MediaSession {
                     decoder,
                     rx_counters,
                     rx_learned,
-                    rx_srtp,
+                    rx_srtp_ctx,
                     rx_recorder,
                 ) {
                     log::error!("Audio RX error: {}", e);
@@ -225,11 +281,12 @@ impl MediaSession {
             });
         }
 
-        // Start RTCP task
+        // Start RTCP task (uses TX context for protect, RX context for unprotect)
         {
             let rtcp_running = running.clone();
             let rtcp_counters = counters.clone();
-            let rtcp_srtp = shared_srtp;
+            let rtcp_tx_srtp = tx_srtp;
+            let rtcp_rx_srtp = rx_srtp;
             tokio::spawn(async move {
                 run_rtcp(
                     rtcp_socket,
@@ -237,7 +294,8 @@ impl MediaSession {
                     ssrc,
                     rtcp_running,
                     rtcp_counters,
-                    rtcp_srtp,
+                    rtcp_tx_srtp,
+                    rtcp_rx_srtp,
                 )
                 .await;
             });
@@ -262,6 +320,7 @@ impl MediaSession {
             recorder: Arc::new(std::sync::Mutex::new(None)),
             tx_recorder_handle,
             rx_recorder_handle,
+            conference_mode: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -344,6 +403,17 @@ impl MediaSession {
     /// Check if muted.
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable conference mode for this session.
+    /// In conference mode, audio from this session participates in multi-party mixing.
+    pub fn set_conference_mode(&self, enabled: bool) {
+        self.conference_mode.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Check if conference mode is enabled.
+    pub fn is_conference_mode(&self) -> bool {
+        self.conference_mode.load(Ordering::Relaxed)
     }
 
     /// Get current statistics.
@@ -527,6 +597,14 @@ fn run_audio_tx(
     let encoder = Arc::new(std::sync::Mutex::new(encoder));
     let sample_buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(1024)));
     let samples_per_frame = 160usize;
+    let native_samples_per_frame = ((samples_per_frame as f64) / resample_ratio).ceil() as usize;
+
+    // Persistent TX resampler: native rate → codec rate (e.g. 48kHz → 8kHz)
+    let tx_resampler = Arc::new(std::sync::Mutex::new(StreamResampler::new(
+        native_rate,
+        codec_rate,
+        native_samples_per_frame,
+    )));
 
     // Silence PCM buffer for muted/keepalive packets (160 samples of silence)
     let silence_pcm: Vec<i16> = vec![0i16; samples_per_frame];
@@ -541,6 +619,7 @@ fn run_audio_tx(
     let cb_counters = counters.clone();
     let cb_rt = rt_handle.clone();
     let cb_recorder = recorder_handle.clone();
+    let cb_resampler = tx_resampler.clone();
     #[cfg(feature = "srtp")]
     let cb_srtp = _srtp.clone();
 
@@ -569,9 +648,6 @@ fn run_audio_tx(
                 };
                 buffer.extend_from_slice(data);
 
-                let native_samples_per_frame =
-                    ((samples_per_frame as f64) / resample_ratio).ceil() as usize;
-
                 while buffer.len() >= native_samples_per_frame {
                     let chunk: Vec<f32> = buffer.drain(..native_samples_per_frame).collect();
 
@@ -579,7 +655,11 @@ fn run_audio_tx(
                     let rms: f32 =
                         (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
 
-                    let resampled = resample_linear(&chunk, native_rate, codec_rate);
+                    // Use persistent streaming resampler for glitch-free audio
+                    let resampled = match cb_resampler.lock() {
+                        Ok(mut r) => r.process(&chunk),
+                        Err(_) => resample_linear(&chunk, native_rate, codec_rate),
+                    };
                     let pcm = f32_to_i16(&resampled);
 
                     // Record TX audio if recording is active
@@ -603,7 +683,14 @@ fn run_audio_tx(
                     let send_packet = if let Some(ref srtp_ctx) = cb_srtp {
                         match srtp_ctx.lock() {
                             Ok(mut ctx) => match ctx.protect_rtp(&packet) {
-                                Ok(encrypted) => encrypted,
+                                Ok(encrypted) => {
+                                    // Log first SRTP protect
+                                    static PROTECT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                    if !PROTECT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                        log::info!("SRTP TX: first packet protected (plain len={}, encrypted len={})", packet.len(), encrypted.len());
+                                    }
+                                    encrypted
+                                }
                                 Err(e) => {
                                     log::error!("SRTP protect failed: {}", e);
                                     continue;
@@ -612,6 +699,7 @@ fn run_audio_tx(
                             Err(_) => packet,
                         }
                     } else {
+                        log::debug!("TX: No SRTP context, sending plain RTP");
                         packet
                     };
 
@@ -813,16 +901,50 @@ fn run_audio_rx(
 
     let codec_rate = 8000u32;
 
+    // Pre-buffer: accumulate 60ms of audio before starting playback to absorb jitter
+    let pre_buffer_samples = (native_rate as usize * 60) / 1000; // 60ms at native rate
+    let max_buffer_samples = native_rate as usize / 2; // 500ms max buffer
+
     let sample_buffer: Arc<std::sync::Mutex<VecDeque<f32>>> = Arc::new(std::sync::Mutex::new(
-        VecDeque::with_capacity(native_rate as usize),
+        VecDeque::with_capacity(max_buffer_samples),
     ));
     let rx_buffer = sample_buffer.clone();
+    let playback_started = Arc::new(AtomicBool::new(false));
+    let pb_started = playback_started.clone();
 
     let stream = device
         .build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 if let Ok(mut buffer) = rx_buffer.lock() {
+                    // Don't start draining until we have enough pre-buffered audio
+                    if !pb_started.load(Ordering::Relaxed) {
+                        if buffer.len() >= pre_buffer_samples {
+                            pb_started.store(true, Ordering::Relaxed);
+                            log::info!(
+                                "Audio RX: pre-buffer filled ({} samples), starting playback",
+                                buffer.len()
+                            );
+                        } else {
+                            // Still buffering — output silence
+                            for out in data.iter_mut() {
+                                *out = 0.0;
+                            }
+                            return;
+                        }
+                    }
+
+                    // If buffer runs critically low, pause playback to re-buffer
+                    // (avoids constant underrun clicks)
+                    if buffer.is_empty() {
+                        pb_started.store(false, Ordering::Relaxed);
+                        log::debug!("Audio RX: buffer underrun, re-buffering");
+                        for out in data.iter_mut() {
+                            *out = 0.0;
+                        }
+                        return;
+                    }
+
                     for out in data.iter_mut() {
                         *out = buffer.pop_front().unwrap_or(0.0);
                     }
@@ -847,72 +969,125 @@ fn run_audio_rx(
         .map_err(|e| Error::device(format!("Failed to create runtime: {}", e)))?;
 
     rt.block_on(async {
+        use crate::jitter::{JitterBuffer, JitterConfig, JitterMode};
+
         let mut buf = [0u8; 2048];
         let mut last_transit: Option<i64> = None;
         let mut first_seq: Option<u16> = None;
 
-        while running.load(Ordering::Relaxed) {
-            let recv = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                socket.recv_from(&mut buf),
-            )
-            .await;
+        // Jitter buffer: 40ms target delay, adapts between 20-150ms
+        let jitter_config = JitterConfig {
+            mode: JitterMode::Adaptive {
+                target_ms: 40,
+                min_ms: 20,
+                max_ms: 150,
+            },
+            clock_rate: codec_rate,
+            max_packets: 50,
+        };
+        let mut jitter_buf = JitterBuffer::new(jitter_config);
 
-            match recv {
-                Ok(Ok((len, from_addr))) => {
-                    // Learn remote address for symmetric RTP
-                    if let Ok(mut lr) = learned_remote.lock()
-                        && lr.is_none()
-                    {
-                        log::info!("Comedia: learned remote RTP address {}", from_addr);
-                        *lr = Some(from_addr);
-                    }
+        // Playout interval: pop from jitter buffer every 20ms
+        let mut playout_interval = tokio::time::interval(std::time::Duration::from_millis(20));
+        playout_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                    #[cfg(feature = "srtp")]
-                    let rtp_data: Vec<u8> = if let Some(ref srtp_ctx) = _srtp {
-                        match srtp_ctx.lock() {
-                            Ok(mut ctx) => match ctx.unprotect_rtp(&buf[..len]) {
-                                Ok(decrypted) => decrypted,
-                                Err(e) => {
-                                    log::warn!("SRTP unprotect failed: {}", e);
-                                    continue;
+        // Persistent resampler: maintains state across frames for glitch-free audio
+        // 160 samples = 20ms at 8kHz codec rate
+        let mut rx_resampler = StreamResampler::new(codec_rate, native_rate, 160);
+
+        loop {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            tokio::select! {
+                // Receive RTP packets and push into jitter buffer
+                recv = socket.recv_from(&mut buf) => {
+                    match recv {
+                        Ok((len, from_addr)) => {
+                            // Learn remote address for symmetric RTP
+                            if let Ok(mut lr) = learned_remote.lock()
+                                && lr.is_none()
+                            {
+                                log::info!("Comedia: learned remote RTP address {}", from_addr);
+                                *lr = Some(from_addr);
+                            }
+
+                            #[cfg(feature = "srtp")]
+                            let rtp_data: Vec<u8> = if let Some(ref srtp_ctx) = _srtp {
+                                match srtp_ctx.lock() {
+                                    Ok(mut ctx) => match ctx.unprotect_rtp(&buf[..len]) {
+                                        Ok(decrypted) => {
+                                            static UNPROTECT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                            let count = UNPROTECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if count == 0 {
+                                                log::info!("SRTP RX: first packet unprotected successfully (encrypted len={}, decrypted len={})", len, decrypted.len());
+                                            }
+                                            decrypted
+                                        }
+                                        Err(e) => {
+                                            log::warn!("SRTP unprotect failed: {}", e);
+                                            continue;
+                                        }
+                                    },
+                                    Err(_) => buf[..len].to_vec(),
                                 }
-                            },
-                            Err(_) => buf[..len].to_vec(),
-                        }
-                    } else {
-                        buf[..len].to_vec()
-                    };
+                            } else {
+                                buf[..len].to_vec()
+                            };
 
-                    #[cfg(not(feature = "srtp"))]
-                    let rtp_data: Vec<u8> = buf[..len].to_vec();
+                            #[cfg(not(feature = "srtp"))]
+                            let rtp_data: Vec<u8> = buf[..len].to_vec();
 
-                    // Track stats
-                    if let Some(seq) = parse_sequence(&rtp_data) {
-                        if first_seq.is_none() {
-                            first_seq = Some(seq);
+                            // Track stats
+                            let seq = parse_sequence(&rtp_data);
+                            let rtp_ts = parse_timestamp(&rtp_data);
+
+                            if let Some(s) = seq {
+                                if first_seq.is_none() {
+                                    first_seq = Some(s);
+                                }
+                                counters.record_received(len as u64, s);
+                            }
+
+                            // Jitter calculation
+                            if let Some(ts) = rtp_ts {
+                                let arrival = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_micros() as i64;
+                                let transit = arrival - (ts as i64 * 125);
+                                if let Some(prev) = last_transit {
+                                    let d = (transit - prev).unsigned_abs();
+                                    counters.update_jitter(d);
+                                }
+                                last_transit = Some(transit);
+                            }
+
+                            // Push into jitter buffer instead of decoding immediately
+                            if let Some((header, payload)) = parse_rtp(&rtp_data) {
+                                let s = header.sequence;
+                                let t = header.timestamp;
+                                jitter_buf.push(s, t, payload.to_vec());
+                            }
                         }
-                        counters.record_received(len as u64, seq);
+                        Err(e) => {
+                            log::error!("RTP recv error: {}", e);
+                        }
                     }
+                }
 
-                    // Jitter calculation
-                    if let Some(rtp_ts) = parse_timestamp(&rtp_data) {
-                        let arrival = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as i64;
-                        let transit = arrival - (rtp_ts as i64 * 125);
-                        if let Some(prev) = last_transit {
-                            let d = (transit - prev).unsigned_abs();
-                            counters.update_jitter(d);
+                // Playout timer: pop from jitter buffer every 20ms
+                _ = playout_interval.tick() => {
+                    if let Some(pkt) = jitter_buf.pop() {
+                        // Decode the payload (empty payload = loss concealment)
+                        let mut pcm = Vec::with_capacity(160);
+                        if pkt.payload.is_empty() {
+                            // Packet loss concealment: repeat last frame as silence
+                            pcm.resize(160, 0i16);
+                        } else {
+                            decoder.decode(&pkt.payload, &mut pcm);
                         }
-                        last_transit = Some(transit);
-                    }
-
-                    // Decode and play
-                    if let Some((_, payload)) = parse_rtp(&rtp_data) {
-                        let mut pcm = Vec::with_capacity(payload.len());
-                        decoder.decode(payload, &mut pcm);
 
                         // Record RX audio if recording is active
                         if let Ok(handle) = recorder_handle.lock() {
@@ -922,22 +1097,18 @@ fn run_audio_rx(
                         }
 
                         let f32_samples = i16_to_f32(&pcm);
-                        let resampled = resample_linear(&f32_samples, codec_rate, native_rate);
+                        let resampled = rx_resampler.process(&f32_samples);
 
                         if let Ok(mut buffer) = sample_buffer.lock() {
-                            for s in resampled {
-                                buffer.push_back(s);
+                            if buffer.len() + resampled.len() > max_buffer_samples {
+                                let excess = buffer.len() + resampled.len() - max_buffer_samples;
+                                buffer.drain(..excess);
+                                log::debug!("Audio RX: buffer overflow, drained {} samples", excess);
                             }
-                            while buffer.len() > native_rate as usize {
-                                buffer.pop_front();
-                            }
+                            buffer.extend(resampled.iter());
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    log::error!("RTP recv error: {}", e);
-                }
-                Err(_) => {} // Timeout
             }
         }
     });
@@ -952,7 +1123,8 @@ async fn run_rtcp(
     ssrc: u32,
     running: Arc<AtomicBool>,
     counters: RtpCounters,
-    _srtp: Option<SharedSrtp>,
+    _tx_srtp: Option<SharedSrtp>,
+    _rx_srtp: Option<SharedSrtp>,
 ) {
     let mut remote_ssrc: u32 = 0;
     let mut buf = [0u8; 512];
@@ -968,7 +1140,7 @@ async fn run_rtcp(
         let sr = build_rtcp_sr(ssrc, stats.packets_sent as u32, stats.bytes_sent as u32);
 
         #[cfg(feature = "srtp")]
-        let sr_to_send = if let Some(ref srtp_ctx) = _srtp {
+        let sr_to_send = if let Some(ref srtp_ctx) = _tx_srtp {
             match srtp_ctx.lock() {
                 Ok(mut ctx) => ctx.protect_rtcp(&sr).unwrap_or(sr),
                 Err(_) => sr,
@@ -1002,7 +1174,7 @@ async fn run_rtcp(
             );
 
             #[cfg(feature = "srtp")]
-            let rr_to_send = if let Some(ref srtp_ctx) = _srtp {
+            let rr_to_send = if let Some(ref srtp_ctx) = _tx_srtp {
                 match srtp_ctx.lock() {
                     Ok(mut ctx) => ctx.protect_rtcp(&rr).unwrap_or(rr),
                     Err(_) => rr,
@@ -1025,7 +1197,7 @@ async fn run_rtcp(
         .await
         {
             #[cfg(feature = "srtp")]
-            let rtcp_data: Vec<u8> = if let Some(ref srtp_ctx) = _srtp {
+            let rtcp_data: Vec<u8> = if let Some(ref srtp_ctx) = _rx_srtp {
                 match srtp_ctx.lock() {
                     Ok(mut ctx) => ctx
                         .unprotect_rtcp(&buf[..len])

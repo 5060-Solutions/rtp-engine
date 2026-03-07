@@ -122,6 +122,17 @@ impl SrtpContext {
                 KEYING_MATERIAL_LEN
             )));
         }
+        log::debug!(
+            "SRTP from_base64: master_key[0..4]={:02x}{:02x}{:02x}{:02x}, salt[0..4]={:02x}{:02x}{:02x}{:02x}",
+            decoded[0],
+            decoded[1],
+            decoded[2],
+            decoded[3],
+            decoded[MASTER_KEY_LEN],
+            decoded[MASTER_KEY_LEN + 1],
+            decoded[MASTER_KEY_LEN + 2],
+            decoded[MASTER_KEY_LEN + 3]
+        );
         Self::new(
             &decoded[..MASTER_KEY_LEN],
             &decoded[MASTER_KEY_LEN..KEYING_MATERIAL_LEN],
@@ -154,6 +165,7 @@ impl SrtpContext {
             u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
 
         // Update ROC for sending
+        let first_packet = !self.initialized;
         if !self.initialized {
             self.s_l = seq;
             self.initialized = true;
@@ -161,6 +173,19 @@ impl SrtpContext {
             self.roc = self.roc.wrapping_add(1);
         }
         self.s_l = seq;
+
+        if first_packet {
+            log::info!(
+                "SRTP TX: first packet - seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                seq,
+                ssrc,
+                self.roc,
+                self.session_key[0],
+                self.session_key[1],
+                self.session_key[2],
+                self.session_key[3]
+            );
+        }
 
         let iv = build_iv(&self.session_salt, ssrc, self.roc, seq);
 
@@ -193,6 +218,7 @@ impl SrtpContext {
             srtp_packet[11],
         ]);
 
+        let first_packet = !self.initialized;
         let estimated_roc = self.estimate_roc(seq);
 
         let auth_boundary = srtp_packet.len() - AUTH_TAG_LEN;
@@ -202,7 +228,32 @@ impl SrtpContext {
         let computed_tag =
             compute_rtp_auth_tag(&self.session_auth_key, authenticated_portion, estimated_roc)?;
         if !constant_time_eq(&computed_tag, received_tag) {
+            log::warn!(
+                "SRTP RX auth failed: seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                seq,
+                ssrc,
+                estimated_roc,
+                self.session_key[0],
+                self.session_key[1],
+                self.session_key[2],
+                self.session_key[3]
+            );
             return Err(Error::srtp("SRTP authentication failed"));
+        }
+
+        if first_packet {
+            log::info!(
+                "SRTP RX: first packet - seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                seq,
+                ssrc,
+                estimated_roc,
+                self.session_key[0],
+                self.session_key[1],
+                self.session_key[2],
+                self.session_key[3]
+            );
+            // Don't set initialized here - let update_roc handle it so it
+            // correctly initializes s_l before any estimate_roc calls.
         }
 
         self.update_roc(seq);
@@ -346,22 +397,31 @@ impl std::fmt::Debug for SrtpContext {
 }
 
 fn build_iv(session_salt: &[u8; SESSION_SALT_LEN], ssrc: u32, roc: u32, seq: u16) -> [u8; 16] {
+    // RFC 3711 Section 4.1:
+    // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (i * 2^16)
+    // k_s (14 bytes) shifted left by 16 bits -> bytes [0..14]
+    // SSRC (4 bytes) shifted left by 64 bits -> bytes [4..8]
+    // i = ROC||SEQ (6 bytes) shifted left by 16 bits -> bytes [8..14]
+    // bytes [14..16] = 0 (AES-CTR block counter)
     let mut iv = [0u8; 16];
     iv[4..8].copy_from_slice(&ssrc.to_be_bytes());
     iv[8..12].copy_from_slice(&roc.to_be_bytes());
     iv[12..14].copy_from_slice(&seq.to_be_bytes());
     for i in 0..SESSION_SALT_LEN {
-        iv[2 + i] ^= session_salt[i];
+        iv[i] ^= session_salt[i];
     }
     iv
 }
 
 fn build_rtcp_iv(session_salt: &[u8; SESSION_SALT_LEN], ssrc: u32, index: u32) -> [u8; 16] {
+    // RFC 3711 Section 3.4:
+    // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (SRTCP index * 2^16)
+    // Same layout as RTP IV but with SRTCP index instead of ROC||SEQ
     let mut iv = [0u8; 16];
     iv[4..8].copy_from_slice(&ssrc.to_be_bytes());
     iv[10..14].copy_from_slice(&index.to_be_bytes());
     for i in 0..SESSION_SALT_LEN {
-        iv[2 + i] ^= session_salt[i];
+        iv[i] ^= session_salt[i];
     }
     iv
 }

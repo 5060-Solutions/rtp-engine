@@ -91,6 +91,7 @@ device = ["dep:cpal"]
 # Core
 log = "0.4"
 thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
 
 # RTP/RTCP
 rand = "0.10"
@@ -117,7 +118,7 @@ sha1 = { version = "0.10", optional = true }
 base64 = "0.22"
 
 # Async runtime for device threads
-tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sync", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }

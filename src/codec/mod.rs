@@ -2,8 +2,9 @@
 //!
 //! This module provides encoding and decoding for common VoIP codecs:
 //!
-//! - **G.711 μ-law (PCMU)**: PT 0, 8kHz, widely supported
-//! - **G.711 A-law (PCMA)**: PT 8, 8kHz, common in Europe
+//! - **G.711 μ-law (PCMU)**: PT 0, 8kHz, 64kbps, universal support
+//! - **G.711 A-law (PCMA)**: PT 8, 8kHz, 64kbps, common in Europe
+//! - **G.729A**: PT 18, 8kHz, 8kbps, low-bandwidth (Annex A, most widely deployed)
 //! - **Opus**: PT 111, 48kHz, modern high-quality codec (feature-gated)
 //!
 //! # Example
@@ -25,11 +26,13 @@
 //! ```
 
 mod g711;
+mod g729;
 
 #[cfg(feature = "opus")]
 mod opus_codec;
 
 pub use g711::{PcmaDecoder, PcmaEncoder, PcmuDecoder, PcmuEncoder};
+pub use g729::{G729Decoder, G729Encoder};
 
 #[cfg(feature = "opus")]
 pub use opus_codec::{OpusDecoder, OpusEncoder};
@@ -37,13 +40,15 @@ pub use opus_codec::{OpusDecoder, OpusEncoder};
 use crate::error::Result;
 
 /// Supported audio codec types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CodecType {
-    /// G.711 μ-law (PCMU) - RTP payload type 0
+    /// G.711 μ-law (PCMU) - RTP payload type 0, 64kbps
     Pcmu,
-    /// G.711 A-law (PCMA) - RTP payload type 8
+    /// G.711 A-law (PCMA) - RTP payload type 8, 64kbps
     Pcma,
-    /// Opus - RTP payload type 111 (dynamic)
+    /// G.729 Annex A - RTP payload type 18, 8kbps (most widely deployed variant)
+    G729,
+    /// Opus - RTP payload type 111 (dynamic), variable bitrate
     #[cfg(feature = "opus")]
     Opus,
 }
@@ -54,6 +59,7 @@ impl CodecType {
         match self {
             Self::Pcmu => 0,
             Self::Pcma => 8,
+            Self::G729 => 18,
             #[cfg(feature = "opus")]
             Self::Opus => 111,
         }
@@ -64,6 +70,7 @@ impl CodecType {
         match self {
             Self::Pcmu => "PCMU",
             Self::Pcma => "PCMA",
+            Self::G729 => "G729",
             #[cfg(feature = "opus")]
             Self::Opus => "opus",
         }
@@ -72,7 +79,7 @@ impl CodecType {
     /// Get the clock rate (samples per second) for this codec.
     pub fn clock_rate(&self) -> u32 {
         match self {
-            Self::Pcmu | Self::Pcma => 8000,
+            Self::Pcmu | Self::Pcma | Self::G729 => 8000,
             #[cfg(feature = "opus")]
             Self::Opus => 48000,
         }
@@ -81,7 +88,7 @@ impl CodecType {
     /// Get the number of channels for this codec.
     pub fn channels(&self) -> u8 {
         match self {
-            Self::Pcmu | Self::Pcma => 1,
+            Self::Pcmu | Self::Pcma | Self::G729 => 1,
             #[cfg(feature = "opus")]
             Self::Opus => 1, // We use mono for VoIP
         }
@@ -89,7 +96,10 @@ impl CodecType {
 
     /// Get the frame duration in milliseconds.
     pub fn frame_duration_ms(&self) -> u32 {
-        20 // Standard 20ms frames for VoIP
+        match self {
+            Self::G729 => 10, // G.729 uses 10ms frames
+            _ => 20,          // Standard 20ms frames for VoIP
+        }
     }
 
     /// Get the number of samples per frame.
@@ -97,11 +107,22 @@ impl CodecType {
         (self.clock_rate() * self.frame_duration_ms() / 1000) as usize
     }
 
+    /// Get the bitrate in kbps.
+    pub fn bitrate_kbps(&self) -> u32 {
+        match self {
+            Self::Pcmu | Self::Pcma => 64,
+            Self::G729 => 8,
+            #[cfg(feature = "opus")]
+            Self::Opus => 32, // Typical for voice
+        }
+    }
+
     /// Parse a codec type from an RTP payload type number.
     pub fn from_payload_type(pt: u8) -> Option<Self> {
         match pt {
             0 => Some(Self::Pcmu),
             8 => Some(Self::Pcma),
+            18 => Some(Self::G729),
             #[cfg(feature = "opus")]
             111 => Some(Self::Opus),
             _ => None,
@@ -113,10 +134,19 @@ impl CodecType {
         match name.to_uppercase().as_str() {
             "PCMU" | "G711U" => Some(Self::Pcmu),
             "PCMA" | "G711A" => Some(Self::Pcma),
+            "G729" | "G.729" | "G729A" | "G.729A" | "G729B" | "G.729B" => Some(Self::G729),
             #[cfg(feature = "opus")]
             "OPUS" => Some(Self::Opus),
             _ => None,
         }
+    }
+
+    /// Get all available codec types.
+    pub fn all() -> Vec<Self> {
+        let mut codecs = vec![Self::Pcmu, Self::Pcma, Self::G729];
+        #[cfg(feature = "opus")]
+        codecs.push(Self::Opus);
+        codecs
     }
 }
 
@@ -167,6 +197,7 @@ pub fn create_encoder(codec: CodecType) -> Result<Box<dyn AudioEncoder>> {
     match codec {
         CodecType::Pcmu => Ok(Box::new(PcmuEncoder::new())),
         CodecType::Pcma => Ok(Box::new(PcmaEncoder::new())),
+        CodecType::G729 => Ok(Box::new(G729Encoder::new())),
         #[cfg(feature = "opus")]
         CodecType::Opus => Ok(Box::new(OpusEncoder::new()?)),
     }
@@ -177,6 +208,7 @@ pub fn create_decoder(codec: CodecType) -> Result<Box<dyn AudioDecoder>> {
     match codec {
         CodecType::Pcmu => Ok(Box::new(PcmuDecoder::new())),
         CodecType::Pcma => Ok(Box::new(PcmaDecoder::new())),
+        CodecType::G729 => Ok(Box::new(G729Decoder::new())),
         #[cfg(feature = "opus")]
         CodecType::Opus => Ok(Box::new(OpusDecoder::new()?)),
     }

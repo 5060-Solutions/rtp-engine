@@ -1,10 +1,12 @@
 //! Audio resampling utilities.
 //!
-//! Provides high-quality sample rate conversion between codec rates (typically 8kHz)
+//! Provides sample rate conversion between codec rates (typically 8kHz)
 //! and device rates (typically 44.1kHz or 48kHz).
 //!
-//! Uses FFT-based synchronous resampling via the `rubato` crate for artifact-free
-//! resampling, especially important when downsampling from 48kHz to 8kHz for VoIP codecs.
+//! For streaming audio (RTP), use `StreamResampler` which maintains state across
+//! calls for glitch-free frame-boundary transitions.
+//!
+//! For one-shot resampling, use `resample_linear`.
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
@@ -140,6 +142,122 @@ pub fn f32_to_i16(input: &[f32]) -> Vec<i16> {
 /// Convert i16 samples to f32 samples (-1.0 to 1.0).
 pub fn i16_to_f32(input: &[i16]) -> Vec<f32> {
     input.iter().map(|&s| s as f32 / 32768.0).collect()
+}
+
+/// A streaming resampler that maintains state across calls for glitch-free audio.
+///
+/// Unlike `resample_linear` which creates a fresh resampler per call (causing
+/// discontinuities at frame boundaries), this struct keeps the rubato resampler
+/// alive so interpolation state carries over between frames.
+///
+/// Use this for continuous audio streams (RTP TX/RX paths).
+pub struct StreamResampler {
+    resampler: Async<f32>,
+    from_rate: u32,
+    to_rate: u32,
+    chunk_size: usize,
+    /// Leftover input samples from previous call (when input isn't exact chunk_size)
+    remainder: Vec<f32>,
+}
+
+impl StreamResampler {
+    /// Create a new streaming resampler.
+    ///
+    /// * `from_rate` - Source sample rate (e.g. 8000 for codec, 48000 for device)
+    /// * `to_rate` - Target sample rate
+    /// * `chunk_size` - Expected input chunk size per call (e.g. 160 for 20ms at 8kHz)
+    pub fn new(from_rate: u32, to_rate: u32, chunk_size: usize) -> Self {
+        let ratio = to_rate as f64 / from_rate as f64;
+        let resampler = Async::<f32>::new_poly(
+            ratio,
+            1.0,
+            PolynomialDegree::Cubic,
+            chunk_size,
+            1,
+            FixedAsync::Input,
+        )
+        .expect("Failed to create streaming resampler");
+
+        Self {
+            resampler,
+            from_rate,
+            to_rate,
+            chunk_size,
+            remainder: Vec::new(),
+        }
+    }
+
+    /// Process a chunk of audio samples, returning resampled output.
+    ///
+    /// Handles variable-length input by buffering remainders internally.
+    /// State is preserved between calls for continuous interpolation.
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if self.from_rate == self.to_rate || input.is_empty() {
+            return input.to_vec();
+        }
+
+        // Append to remainder from previous call
+        self.remainder.extend_from_slice(input);
+
+        let mut output = Vec::new();
+
+        // Process full chunks
+        while self.remainder.len() >= self.chunk_size {
+            let chunk: Vec<f32> = self.remainder.drain(..self.chunk_size).collect();
+            match self.process_chunk(&chunk) {
+                Ok(resampled) => output.extend(resampled),
+                Err(_) => {
+                    // Fallback to simple linear for this chunk
+                    output.extend(resample_linear_simple(&chunk, self.from_rate, self.to_rate));
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Flush any remaining samples (call when stream ends).
+    pub fn flush(&mut self) -> Vec<f32> {
+        if self.remainder.is_empty() {
+            return Vec::new();
+        }
+        let remaining = std::mem::take(&mut self.remainder);
+        resample_linear_simple(&remaining, self.from_rate, self.to_rate)
+    }
+
+    fn process_chunk(&mut self, chunk: &[f32]) -> Result<Vec<f32>, String> {
+        let ratio = self.to_rate as f64 / self.from_rate as f64;
+        let expected_output_len = ((chunk.len() as f64) * ratio).ceil() as usize;
+        let buffer_len = expected_output_len + 64;
+
+        let input_vec = vec![chunk.to_vec()];
+        let input_adapter = SequentialSliceOfVecs::new(&input_vec, 1, chunk.len())
+            .map_err(|e| format!("Input adapter error: {}", e))?;
+
+        let mut output_vec = vec![vec![0.0f32; buffer_len]];
+        let mut output_adapter = SequentialSliceOfVecs::new_mut(&mut output_vec, 1, buffer_len)
+            .map_err(|e| format!("Output adapter error: {}", e))?;
+
+        let (_, frames_written) = self
+            .resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, None)
+            .map_err(|e| format!("Resample error: {:?}", e))?;
+
+        let mut result = output_vec.into_iter().next().unwrap_or_default();
+        result.truncate(frames_written);
+        Ok(result)
+    }
+}
+
+impl std::fmt::Debug for StreamResampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamResampler")
+            .field("from_rate", &self.from_rate)
+            .field("to_rate", &self.to_rate)
+            .field("chunk_size", &self.chunk_size)
+            .field("remainder", &self.remainder.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]
