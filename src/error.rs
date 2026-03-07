@@ -32,6 +32,10 @@ pub enum Error {
     #[error("network error: {0}")]
     Network(#[from] std::io::Error),
 
+    /// STUN protocol error.
+    #[error("STUN error: {0}")]
+    Stun(String),
+
     /// Invalid configuration or parameter.
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
@@ -61,6 +65,11 @@ impl Error {
     /// Create a device error.
     pub fn device(msg: impl Into<String>) -> Self {
         Self::Device(msg.into())
+    }
+
+    /// Create a STUN error.
+    pub fn stun(msg: impl Into<String>) -> Self {
+        Self::Stun(msg.into())
     }
 
     /// Create an invalid parameter error.

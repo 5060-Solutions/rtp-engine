@@ -404,17 +404,32 @@ Licensed under either of:
 
 at your option.
 
+## Development Setup
+
+After cloning the repository, run the setup script to install dependencies, configure git hooks, and verify everything builds:
+
+```bash
+./setup.sh
+```
+
+This will:
+- Install/update the Rust toolchain with `rustfmt` and `clippy`
+- Install system dependencies (ALSA + Opus on Linux, Opus on macOS)
+- Configure pre-commit hooks that run `cargo fmt --check` and `cargo clippy`
+- Build the project and run all checks
+
 ## Contributing
 
 Contributions are welcome! Please:
 
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Ensure tests pass (`cargo test`)
-4. Ensure clippy passes (`cargo clippy`)
-5. Commit your changes (`git commit -m 'Add amazing feature'`)
-6. Push to the branch (`git push origin feature/amazing-feature`)
-7. Open a Pull Request
+2. Run `./setup.sh` to set up your development environment
+3. Create a feature branch (`git checkout -b feature/amazing-feature`)
+4. Ensure tests pass (`cargo test`)
+5. Ensure clippy passes (`cargo clippy`)
+6. Commit your changes — the pre-commit hook will catch formatting and lint issues
+7. Push to the branch (`git push origin feature/amazing-feature`)
+8. Open a Pull Request
 
 ## Acknowledgments
 

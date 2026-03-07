@@ -54,6 +54,7 @@ pub mod codec;
 pub mod error;
 pub mod jitter;
 pub mod rtp;
+pub mod stun;
 
 #[cfg(feature = "srtp")]
 pub mod srtp;
@@ -61,6 +62,12 @@ pub mod srtp;
 #[cfg(feature = "device")]
 pub mod device;
 
+#[cfg(feature = "device")]
+pub use device::{
+    AudioDevice, AudioDevices, list_all_devices, list_input_devices, list_output_devices,
+};
+
+pub mod recorder;
 pub mod resample;
 mod session;
 
@@ -68,9 +75,13 @@ mod session;
 pub use codec::CodecType;
 pub use error::{Error, Result};
 pub use jitter::{JitterBuffer, JitterConfig, JitterMode, JitterStats};
+pub use recorder::{CallRecorder, RecorderHandle, generate_recording_filename};
 pub use resample::{f32_to_i16, i16_to_f32, resample_linear, resample_linear_i16};
 pub use rtp::RtpStats;
 pub use session::MediaSession;
+pub use stun::{
+    DEFAULT_STUN_SERVERS, StunResult, discover as stun_discover, discover_public_address,
+};
 
 #[cfg(feature = "srtp")]
 pub use srtp::SrtpContext;

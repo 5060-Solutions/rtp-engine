@@ -4,16 +4,17 @@
 //! microphone capture → encoding → RTP transmission → reception → decoding → speaker playback.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 
-use crate::codec::{create_decoder, create_encoder, AudioDecoder, AudioEncoder, CodecType};
+use crate::codec::{AudioDecoder, AudioEncoder, CodecType, create_decoder, create_encoder};
 use crate::error::{Error, Result};
+use crate::recorder::{CallRecorder, RecorderHandle};
 use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
 use crate::rtp::{
-    build_rtcp_rr, build_rtcp_sr, parse_rtp, parse_sequence, parse_timestamp, RtpCounters,
-    RtpHeader, RtpStats,
+    RtpCounters, RtpHeader, RtpStats, build_rtcp_rr, build_rtcp_sr, parse_rtp, parse_sequence,
+    parse_timestamp,
 };
 
 #[cfg(feature = "srtp")]
@@ -33,6 +34,7 @@ type SharedSrtp = Arc<std::sync::Mutex<SrtpContext>>;
 /// - RTP packet reception
 /// - Decoding and playback to speaker
 /// - RTCP statistics reporting
+/// - Optional call recording
 pub struct MediaSession {
     muted: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -42,6 +44,9 @@ pub struct MediaSession {
     rtp_socket: Arc<UdpSocket>,
     ssrc: u32,
     remote_addr: SocketAddr,
+    recorder: Arc<std::sync::Mutex<Option<CallRecorder>>>,
+    tx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
+    rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
 }
 
 impl MediaSession {
@@ -74,7 +79,7 @@ impl MediaSession {
         // Make sure port is even (RTP convention) - if odd, try again
         if rtp_port % 2 != 0 {
             drop(rtp_socket);
-            return Self::allocate_port().await; // Retry for even port
+            return Box::pin(Self::allocate_port()).await;
         }
 
         // Try to bind RTCP port (RTP + 1) to verify it's available
@@ -84,7 +89,7 @@ impl MediaSession {
         if rtcp_socket.is_err() {
             // RTCP port not available, try again
             drop(rtp_socket);
-            return Self::allocate_port().await;
+            return Box::pin(Self::allocate_port()).await;
         }
 
         // Both ports verified available - drop sockets and return the port
@@ -140,6 +145,12 @@ impl MediaSession {
         let learned_remote: Arc<std::sync::Mutex<Option<SocketAddr>>> =
             Arc::new(std::sync::Mutex::new(None));
 
+        // Recorder handles (will be populated when recording starts)
+        let tx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         let encoder = create_encoder(codec_type)?;
         let decoder = create_decoder(codec_type)?;
 
@@ -155,9 +166,10 @@ impl MediaSession {
             .await
             .map_err(|e| Error::Network(e))?;
         let rtcp_socket = Arc::new(rtcp_socket);
-        let remote_rtcp_addr: SocketAddr = format!("{}:{}", remote_addr.ip(), remote_addr.port() + 1)
-            .parse()
-            .unwrap_or(remote_addr);
+        let remote_rtcp_addr: SocketAddr =
+            format!("{}:{}", remote_addr.ip(), remote_addr.port() + 1)
+                .parse()
+                .unwrap_or(remote_addr);
 
         // Start TX thread (microphone → RTP)
         #[cfg(feature = "device")]
@@ -168,6 +180,7 @@ impl MediaSession {
             let tx_counters = counters.clone();
             let tx_learned = learned_remote.clone();
             let tx_srtp = shared_srtp.clone();
+            let tx_recorder = tx_recorder_handle.clone();
 
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_tx(
@@ -180,6 +193,7 @@ impl MediaSession {
                     tx_counters,
                     tx_learned,
                     tx_srtp,
+                    tx_recorder,
                 ) {
                     log::error!("Audio TX error: {}", e);
                 }
@@ -194,9 +208,18 @@ impl MediaSession {
             let rx_counters = counters.clone();
             let rx_learned = learned_remote.clone();
             let rx_srtp = shared_srtp.clone();
+            let rx_recorder = rx_recorder_handle.clone();
 
             std::thread::spawn(move || {
-                if let Err(e) = run_audio_rx(rx_socket, rx_running, decoder, rx_counters, rx_learned, rx_srtp) {
+                if let Err(e) = run_audio_rx(
+                    rx_socket,
+                    rx_running,
+                    decoder,
+                    rx_counters,
+                    rx_learned,
+                    rx_srtp,
+                    rx_recorder,
+                ) {
                     log::error!("Audio RX error: {}", e);
                 }
             });
@@ -208,7 +231,15 @@ impl MediaSession {
             let rtcp_counters = counters.clone();
             let rtcp_srtp = shared_srtp;
             tokio::spawn(async move {
-                run_rtcp(rtcp_socket, remote_rtcp_addr, ssrc, rtcp_running, rtcp_counters, rtcp_srtp).await;
+                run_rtcp(
+                    rtcp_socket,
+                    remote_rtcp_addr,
+                    ssrc,
+                    rtcp_running,
+                    rtcp_counters,
+                    rtcp_srtp,
+                )
+                .await;
             });
         }
 
@@ -228,6 +259,9 @@ impl MediaSession {
             rtp_socket,
             ssrc,
             remote_addr,
+            recorder: Arc::new(std::sync::Mutex::new(None)),
+            tx_recorder_handle,
+            rx_recorder_handle,
         })
     }
 
@@ -254,7 +288,12 @@ impl MediaSession {
 
         let socket = self.rtp_socket.clone();
         let ssrc = self.ssrc;
-        let dest = self.learned_remote.lock().ok().and_then(|g| *g).unwrap_or(self.remote_addr);
+        let dest = self
+            .learned_remote
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(self.remote_addr);
         let counters = self.counters.clone();
 
         tokio::spawn(async move {
@@ -332,6 +371,85 @@ impl MediaSession {
         self.learned_remote.lock().ok().and_then(|g| *g)
     }
 
+    /// Start recording the call to a WAV file.
+    ///
+    /// The recording captures both TX (microphone) and RX (speaker) audio
+    /// as a stereo WAV file with TX on the left channel and RX on the right.
+    ///
+    /// # Arguments
+    /// * `output_path` - Path for the output WAV file
+    pub fn start_recording(&self, output_path: std::path::PathBuf) -> Result<()> {
+        let recorder = CallRecorder::new(output_path, 8000); // VoIP sample rate
+
+        // Get handles for TX and RX
+        let tx_handle = recorder.tx_handle();
+        let rx_handle = recorder.rx_handle();
+
+        // Start recording
+        recorder.start();
+
+        // Store handles for the audio threads to use
+        if let Ok(mut handle) = self.tx_recorder_handle.lock() {
+            *handle = Some(tx_handle);
+        }
+        if let Ok(mut handle) = self.rx_recorder_handle.lock() {
+            *handle = Some(rx_handle);
+        }
+
+        // Store the recorder
+        if let Ok(mut rec) = self.recorder.lock() {
+            *rec = Some(recorder);
+        }
+
+        log::info!("Call recording started");
+        Ok(())
+    }
+
+    /// Stop recording and save the WAV file.
+    ///
+    /// Returns the path to the saved recording.
+    pub fn stop_recording(&self) -> Result<Option<std::path::PathBuf>> {
+        // Clear handles first
+        if let Ok(mut handle) = self.tx_recorder_handle.lock() {
+            *handle = None;
+        }
+        if let Ok(mut handle) = self.rx_recorder_handle.lock() {
+            *handle = None;
+        }
+
+        // Stop and save
+        if let Ok(mut rec) = self.recorder.lock() {
+            if let Some(recorder) = rec.take() {
+                let path = recorder
+                    .stop()
+                    .map_err(|e| Error::device(format!("Recording save failed: {}", e)))?;
+                log::info!("Call recording stopped and saved");
+                return Ok(Some(path));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check if recording is currently active.
+    pub fn is_recording(&self) -> bool {
+        self.recorder
+            .lock()
+            .ok()
+            .and_then(|r| r.as_ref().map(super::recorder::CallRecorder::is_recording))
+            .unwrap_or(false)
+    }
+
+    /// Get a clone of the TX recorder handle (for audio thread integration).
+    pub fn get_tx_recorder_handle(&self) -> Option<RecorderHandle> {
+        self.tx_recorder_handle.lock().ok().and_then(|h| h.clone())
+    }
+
+    /// Get a clone of the RX recorder handle (for audio thread integration).
+    pub fn get_rx_recorder_handle(&self) -> Option<RecorderHandle> {
+        self.rx_recorder_handle.lock().ok().and_then(|h| h.clone())
+    }
+
     /// Stop the media session.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
@@ -357,7 +475,6 @@ impl std::fmt::Debug for MediaSession {
     }
 }
 
-
 // --- Audio TX/RX implementation ---
 
 #[cfg(feature = "device")]
@@ -371,11 +488,14 @@ fn run_audio_tx(
     counters: RtpCounters,
     learned_remote: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     _srtp: Option<SharedSrtp>,
+    recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
 ) -> Result<()> {
     use std::sync::atomic::AtomicU16;
 
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or_else(|| Error::device("No input device"))?;
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| Error::device("No input device"))?;
 
     let default_config = device
         .default_input_config()
@@ -420,8 +540,15 @@ fn run_audio_tx(
     let cb_learned = learned_remote.clone();
     let cb_counters = counters.clone();
     let cb_rt = rt_handle.clone();
+    let cb_recorder = recorder_handle.clone();
     #[cfg(feature = "srtp")]
     let cb_srtp = _srtp.clone();
+
+    // Counter for logging mic audio packets (only log periodically to avoid spam)
+    let mic_packet_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cb_mic_count = mic_packet_count.clone();
+    let first_audio_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cb_first_logged = first_audio_logged.clone();
 
     let stream = device
         .build_input_stream(
@@ -447,8 +574,20 @@ fn run_audio_tx(
 
                 while buffer.len() >= native_samples_per_frame {
                     let chunk: Vec<f32> = buffer.drain(..native_samples_per_frame).collect();
+
+                    // Calculate audio level for debugging (RMS)
+                    let rms: f32 =
+                        (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+
                     let resampled = resample_linear(&chunk, native_rate, codec_rate);
                     let pcm = f32_to_i16(&resampled);
+
+                    // Record TX audio if recording is active
+                    if let Ok(handle) = cb_recorder.lock() {
+                        if let Some(ref rec) = *handle {
+                            rec.add_samples(&pcm);
+                        }
+                    }
 
                     let current_seq = cb_seq.fetch_add(1, Ordering::Relaxed);
                     let current_ts = cb_ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
@@ -481,6 +620,19 @@ fn run_audio_tx(
 
                     cb_counters.record_sent(send_packet.len() as u64);
 
+                    // Log first audio packet and then periodically (every 50 packets = ~1 second)
+                    let count = cb_mic_count.fetch_add(1, Ordering::Relaxed);
+                    if !cb_first_logged.swap(true, Ordering::Relaxed) {
+                        log::info!("Audio TX: first mic packet captured, rms={:.4}", rms);
+                    } else if count % 50 == 0 {
+                        log::debug!(
+                            "Audio TX: sent {} mic packets, seq={}, rms={:.4}",
+                            count + 1,
+                            current_seq,
+                            rms
+                        );
+                    }
+
                     let dest = cb_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
                     let socket = cb_socket.clone();
                     cb_rt.spawn(async move {
@@ -493,7 +645,17 @@ fn run_audio_tx(
         )
         .map_err(|e| Error::device(format!("Failed to build input stream: {}", e)))?;
 
-    stream.play().map_err(|e| Error::device(format!("Failed to start input: {}", e)))?;
+    stream
+        .play()
+        .map_err(|e| Error::device(format!("Failed to start input: {}", e)))?;
+    let device_name = device
+        .description()
+        .ok()
+        .map_or_else(|| "unknown".to_string(), |d| d.name().to_string());
+    log::info!(
+        "Audio TX: microphone stream started on device '{}'",
+        device_name
+    );
 
     // Keepalive/silence packet sender - sends RTP every 20ms when muted or as initial NAT punch
     // This ensures NAT pinholes stay open and symmetric RTP works even without mic input
@@ -550,7 +712,11 @@ fn run_audio_tx(
 
                 keepalive_counters.record_sent(send_packet.len() as u64);
 
-                let dest = keepalive_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
+                let dest = keepalive_learned
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .unwrap_or(remote);
                 let _ = keepalive_socket.send_to(&send_packet, dest).await;
 
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -596,7 +762,11 @@ fn run_audio_tx(
 
                 keepalive_counters.record_sent(send_packet.len() as u64);
 
-                let dest = keepalive_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
+                let dest = keepalive_learned
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .unwrap_or(remote);
                 let _ = keepalive_socket.send_to(&send_packet, dest).await;
             }
         });
@@ -607,7 +777,7 @@ fn run_audio_tx(
     }
 
     drop(stream);
-    drop(rt);  // Shutdown the TX runtime after stream is done
+    drop(rt); // Shutdown the TX runtime after stream is done
     Ok(())
 }
 
@@ -619,11 +789,14 @@ fn run_audio_rx(
     counters: RtpCounters,
     learned_remote: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     _srtp: Option<SharedSrtp>,
+    recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
 ) -> Result<()> {
     use std::collections::VecDeque;
 
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or_else(|| Error::device("No output device"))?;
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| Error::device("No output device"))?;
 
     let default_config = device
         .default_output_config()
@@ -640,8 +813,9 @@ fn run_audio_rx(
 
     let codec_rate = 8000u32;
 
-    let sample_buffer: Arc<std::sync::Mutex<VecDeque<f32>>> =
-        Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(native_rate as usize)));
+    let sample_buffer: Arc<std::sync::Mutex<VecDeque<f32>>> = Arc::new(std::sync::Mutex::new(
+        VecDeque::with_capacity(native_rate as usize),
+    ));
     let rx_buffer = sample_buffer.clone();
 
     let stream = device
@@ -663,7 +837,9 @@ fn run_audio_rx(
         )
         .map_err(|e| Error::device(format!("Failed to build output stream: {}", e)))?;
 
-    stream.play().map_err(|e| Error::device(format!("Failed to start output: {}", e)))?;
+    stream
+        .play()
+        .map_err(|e| Error::device(format!("Failed to start output: {}", e)))?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -737,6 +913,13 @@ fn run_audio_rx(
                     if let Some((_, payload)) = parse_rtp(&rtp_data) {
                         let mut pcm = Vec::with_capacity(payload.len());
                         decoder.decode(payload, &mut pcm);
+
+                        // Record RX audio if recording is active
+                        if let Ok(handle) = recorder_handle.lock() {
+                            if let Some(ref rec) = *handle {
+                                rec.add_samples(&pcm);
+                            }
+                        }
 
                         let f32_samples = i16_to_f32(&pcm);
                         let resampled = resample_linear(&f32_samples, codec_rate, native_rate);
@@ -844,7 +1027,9 @@ async fn run_rtcp(
             #[cfg(feature = "srtp")]
             let rtcp_data: Vec<u8> = if let Some(ref srtp_ctx) = _srtp {
                 match srtp_ctx.lock() {
-                    Ok(mut ctx) => ctx.unprotect_rtcp(&buf[..len]).unwrap_or_else(|_| buf[..len].to_vec()),
+                    Ok(mut ctx) => ctx
+                        .unprotect_rtcp(&buf[..len])
+                        .unwrap_or_else(|_| buf[..len].to_vec()),
                     Err(_) => buf[..len].to_vec(),
                 }
             } else {
@@ -855,7 +1040,8 @@ async fn run_rtcp(
             let rtcp_data: Vec<u8> = buf[..len].to_vec();
 
             if rtcp_data.len() >= 8 && (rtcp_data[1] == 200 || rtcp_data[1] == 201) {
-                remote_ssrc = u32::from_be_bytes([rtcp_data[4], rtcp_data[5], rtcp_data[6], rtcp_data[7]]);
+                remote_ssrc =
+                    u32::from_be_bytes([rtcp_data[4], rtcp_data[5], rtcp_data[6], rtcp_data[7]]);
             }
         }
     }
@@ -880,7 +1066,7 @@ mod tests {
         // Try to bind to a privileged port (requires root)
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         let result = MediaSession::start(80, remote, CodecType::Pcmu).await;
-        
+
         // Should fail on non-root systems
         // This tests error handling path
         if result.is_err() {
@@ -893,10 +1079,10 @@ mod tests {
         // Use a random high port to avoid conflicts
         let port = 50000 + (rand::random::<u16>() % 10000);
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
-        
+
         // This will fail in CI without audio devices, but tests the creation path
         let result = MediaSession::start(port, remote, CodecType::Pcmu).await;
-        
+
         // In environments without audio, this fails at device setup
         // In environments with audio, it succeeds
         // Either way, we're testing the code path
@@ -910,7 +1096,8 @@ mod tests {
                 // Expected on CI without audio devices
                 assert!(
                     matches!(e, Error::Device(_)) || matches!(e, Error::Network(_)),
-                    "Unexpected error type: {:?}", e
+                    "Unexpected error type: {:?}",
+                    e
                 );
             }
         }
@@ -920,7 +1107,7 @@ mod tests {
     fn test_rtp_counters_initialization() {
         let counters = RtpCounters::new("PCMU");
         let stats = counters.snapshot();
-        
+
         assert_eq!(stats.packets_sent, 0);
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.packets_received, 0);
@@ -939,14 +1126,14 @@ mod tests {
         // Test encoder creation
         let encoder = create_encoder(CodecType::Pcmu);
         assert!(encoder.is_ok());
-        
+
         let encoder = create_encoder(CodecType::Pcma);
         assert!(encoder.is_ok());
-        
+
         // Test decoder creation
         let decoder = create_decoder(CodecType::Pcmu);
         assert!(decoder.is_ok());
-        
+
         let decoder = create_decoder(CodecType::Pcma);
         assert!(decoder.is_ok());
     }
@@ -955,14 +1142,16 @@ mod tests {
     #[test]
     fn test_srtp_context_for_session() {
         use crate::srtp::SrtpContext;
-        
+
         let (_ctx, key) = SrtpContext::generate().unwrap();
         assert!(!key.is_empty());
-        
+
         // Context should be able to protect/unprotect
-        let mut test_rtp = vec![0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x12, 0x34, 0x56, 0x78];
+        let mut test_rtp = vec![
+            0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x12, 0x34, 0x56, 0x78,
+        ];
         test_rtp.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        
+
         let mut ctx_clone = SrtpContext::from_base64(&key).unwrap();
         let protected = ctx_clone.protect_rtp(&test_rtp);
         assert!(protected.is_ok());

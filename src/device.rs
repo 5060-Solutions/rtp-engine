@@ -227,7 +227,75 @@ impl Drop for AudioPlayback {
     }
 }
 
-/// Query available audio devices.
+/// Information about an audio device.
+#[derive(Debug, Clone)]
+pub struct AudioDevice {
+    /// Device name/identifier
+    pub name: String,
+    /// Whether this is the default device
+    pub is_default: bool,
+}
+
+/// Lists of available audio devices.
+#[derive(Debug, Clone, Default)]
+pub struct AudioDevices {
+    /// Available input (microphone) devices
+    pub input_devices: Vec<AudioDevice>,
+    /// Available output (speaker) devices
+    pub output_devices: Vec<AudioDevice>,
+}
+
+/// Query available audio input devices (microphones).
+pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.description().ok())
+        .map(|d| d.name().to_string());
+
+    let mut devices = Vec::new();
+    if let Ok(input_devices) = host.input_devices() {
+        for device in input_devices {
+            if let Ok(desc) = device.description() {
+                let name = desc.name().to_string();
+                let is_default = default_name.as_ref() == Some(&name);
+                devices.push(AudioDevice { name, is_default });
+            }
+        }
+    }
+    Ok(devices)
+}
+
+/// Query available audio output devices (speakers).
+pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_output_device()
+        .and_then(|d| d.description().ok())
+        .map(|d| d.name().to_string());
+
+    let mut devices = Vec::new();
+    if let Ok(output_devices) = host.output_devices() {
+        for device in output_devices {
+            if let Ok(desc) = device.description() {
+                let name = desc.name().to_string();
+                let is_default = default_name.as_ref() == Some(&name);
+                devices.push(AudioDevice { name, is_default });
+            }
+        }
+    }
+    Ok(devices)
+}
+
+/// Query all available audio devices (both input and output).
+pub fn list_all_devices() -> Result<AudioDevices> {
+    Ok(AudioDevices {
+        input_devices: list_input_devices()?,
+        output_devices: list_output_devices()?,
+    })
+}
+
+/// Query available audio devices (legacy - returns combined list).
 pub fn list_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let mut devices = Vec::new();

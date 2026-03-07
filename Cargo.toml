@@ -98,6 +98,14 @@ rand = "0.10"
 # Audio device (optional)
 cpal = { version = "0.17", optional = true }
 
+# High-quality audio resampling
+rubato = "1.0"
+audioadapter-buffers = "2.0"
+
+# Timestamps for recording filenames
+chrono = "0.4"
+
+
 # Opus codec (optional)
 audiopus = { version = "0.3.0-rc.0", optional = true }
 
@@ -109,7 +117,7 @@ sha1 = { version = "0.10", optional = true }
 base64 = "0.22"
 
 # Async runtime for device threads
-tokio = { version = "1", features = ["net", "time", "rt", "sync"] }
+tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
