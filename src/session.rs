@@ -4,16 +4,16 @@
 //! microphone capture → encoding → RTP transmission → reception → decoding → speaker playback.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-use crate::codec::{AudioDecoder, AudioEncoder, CodecType, create_decoder, create_encoder};
+use crate::codec::{create_decoder, create_encoder, AudioDecoder, AudioEncoder, CodecType};
 use crate::error::{Error, Result};
 use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
 use crate::rtp::{
-    RtpCounters, RtpHeader, RtpStats, build_rtcp_rr, build_rtcp_sr, parse_rtp, parse_sequence,
-    parse_timestamp,
+    build_rtcp_rr, build_rtcp_sr, parse_rtp, parse_sequence, parse_timestamp, RtpCounters,
+    RtpHeader, RtpStats,
 };
 
 #[cfg(feature = "srtp")]
@@ -103,10 +103,9 @@ impl MediaSession {
             .await
             .map_err(|e| Error::Network(e))?;
         let rtcp_socket = Arc::new(rtcp_socket);
-        let remote_rtcp_addr: SocketAddr =
-            format!("{}:{}", remote_addr.ip(), remote_addr.port() + 1)
-                .parse()
-                .unwrap_or(remote_addr);
+        let remote_rtcp_addr: SocketAddr = format!("{}:{}", remote_addr.ip(), remote_addr.port() + 1)
+            .parse()
+            .unwrap_or(remote_addr);
 
         // Start TX thread (microphone → RTP)
         #[cfg(feature = "device")]
@@ -145,14 +144,7 @@ impl MediaSession {
             let rx_srtp = shared_srtp.clone();
 
             std::thread::spawn(move || {
-                if let Err(e) = run_audio_rx(
-                    rx_socket,
-                    rx_running,
-                    decoder,
-                    rx_counters,
-                    rx_learned,
-                    rx_srtp,
-                ) {
+                if let Err(e) = run_audio_rx(rx_socket, rx_running, decoder, rx_counters, rx_learned, rx_srtp) {
                     log::error!("Audio RX error: {}", e);
                 }
             });
@@ -164,15 +156,7 @@ impl MediaSession {
             let rtcp_counters = counters.clone();
             let rtcp_srtp = shared_srtp;
             tokio::spawn(async move {
-                run_rtcp(
-                    rtcp_socket,
-                    remote_rtcp_addr,
-                    ssrc,
-                    rtcp_running,
-                    rtcp_counters,
-                    rtcp_srtp,
-                )
-                .await;
+                run_rtcp(rtcp_socket, remote_rtcp_addr, ssrc, rtcp_running, rtcp_counters, rtcp_srtp).await;
             });
         }
 
@@ -218,12 +202,7 @@ impl MediaSession {
 
         let socket = self.rtp_socket.clone();
         let ssrc = self.ssrc;
-        let dest = self
-            .learned_remote
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .unwrap_or(self.remote_addr);
+        let dest = self.learned_remote.lock().ok().and_then(|g| *g).unwrap_or(self.remote_addr);
         let counters = self.counters.clone();
 
         tokio::spawn(async move {
@@ -326,6 +305,7 @@ impl std::fmt::Debug for MediaSession {
     }
 }
 
+
 // --- Audio TX/RX implementation ---
 
 #[cfg(feature = "device")]
@@ -343,9 +323,7 @@ fn run_audio_tx(
     use std::sync::atomic::AtomicU16;
 
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| Error::device("No input device"))?;
+    let device = host.default_input_device().ok_or_else(|| Error::device("No input device"))?;
 
     let default_config = device
         .default_input_config()
@@ -371,12 +349,30 @@ fn run_audio_tx(
     let sample_buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(1024)));
     let samples_per_frame = 160usize;
 
+    // Silence PCM buffer for muted/keepalive packets (160 samples of silence)
+    let silence_pcm: Vec<i16> = vec![0i16; samples_per_frame];
+
     let cb_running = running.clone();
+    let cb_muted = muted.clone();
+    let cb_seq = seq.clone();
+    let cb_ts = ts.clone();
+    let cb_encoder = encoder.clone();
+    let cb_socket = socket.clone();
+    let cb_learned = learned_remote.clone();
+    let cb_counters = counters.clone();
+    #[cfg(feature = "srtp")]
+    let cb_srtp = _srtp.clone();
+
     let stream = device
         .build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !cb_running.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
+                if !cb_running.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // When muted, skip mic data processing but let keepalive task send silence
+                if cb_muted.load(Ordering::Relaxed) {
                     return;
                 }
 
@@ -394,18 +390,18 @@ fn run_audio_tx(
                     let resampled = resample_linear(&chunk, native_rate, codec_rate);
                     let pcm = f32_to_i16(&resampled);
 
-                    let current_seq = seq.fetch_add(1, Ordering::Relaxed);
-                    let current_ts = ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
+                    let current_seq = cb_seq.fetch_add(1, Ordering::Relaxed);
+                    let current_ts = cb_ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
 
                     let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
                     let mut packet = header.to_bytes();
 
-                    if let Ok(mut enc) = encoder.lock() {
+                    if let Ok(mut enc) = cb_encoder.lock() {
                         enc.encode(&pcm, &mut packet);
                     }
 
                     #[cfg(feature = "srtp")]
-                    let send_packet = if let Some(ref srtp_ctx) = _srtp {
+                    let send_packet = if let Some(ref srtp_ctx) = cb_srtp {
                         match srtp_ctx.lock() {
                             Ok(mut ctx) => match ctx.protect_rtp(&packet) {
                                 Ok(encrypted) => encrypted,
@@ -423,14 +419,10 @@ fn run_audio_tx(
                     #[cfg(not(feature = "srtp"))]
                     let send_packet = packet;
 
-                    counters.record_sent(send_packet.len() as u64);
+                    cb_counters.record_sent(send_packet.len() as u64);
 
-                    let dest = learned_remote
-                        .lock()
-                        .ok()
-                        .and_then(|g| *g)
-                        .unwrap_or(remote);
-                    let socket = socket.clone();
+                    let dest = cb_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
+                    let socket = cb_socket.clone();
                     rt.spawn(async move {
                         let _ = socket.send_to(&send_packet, dest).await;
                     });
@@ -441,9 +433,114 @@ fn run_audio_tx(
         )
         .map_err(|e| Error::device(format!("Failed to build input stream: {}", e)))?;
 
-    stream
-        .play()
-        .map_err(|e| Error::device(format!("Failed to start input: {}", e)))?;
+    stream.play().map_err(|e| Error::device(format!("Failed to start input: {}", e)))?;
+
+    // Keepalive/silence packet sender - sends RTP every 20ms when muted or as initial NAT punch
+    // This ensures NAT pinholes stay open and symmetric RTP works even without mic input
+    let keepalive_running = running.clone();
+    let keepalive_muted = muted.clone();
+    let keepalive_socket = socket.clone();
+    let keepalive_learned = learned_remote.clone();
+    let keepalive_counters = counters.clone();
+    let keepalive_encoder = encoder.clone();
+    #[cfg(feature = "srtp")]
+    let keepalive_srtp = _srtp.clone();
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::error!("Failed to create keepalive runtime: {}", e);
+                return;
+            }
+        };
+
+        rt.block_on(async {
+            // Send initial NAT punch packets immediately (5 packets over 100ms)
+            for _ in 0..5 {
+                if !keepalive_running.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let current_seq = seq.fetch_add(1, Ordering::Relaxed);
+                let current_ts = ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
+
+                let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
+                let mut packet = header.to_bytes();
+
+                if let Ok(mut enc) = keepalive_encoder.lock() {
+                    enc.encode(&silence_pcm, &mut packet);
+                }
+
+                #[cfg(feature = "srtp")]
+                let send_packet = if let Some(ref srtp_ctx) = keepalive_srtp {
+                    match srtp_ctx.lock() {
+                        Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
+                        Err(_) => packet,
+                    }
+                } else {
+                    packet
+                };
+
+                #[cfg(not(feature = "srtp"))]
+                let send_packet = packet;
+
+                keepalive_counters.record_sent(send_packet.len() as u64);
+
+                let dest = keepalive_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
+                let _ = keepalive_socket.send_to(&send_packet, dest).await;
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            log::info!("Sent initial NAT punch packets to {}", remote);
+
+            // Continue sending keepalive silence packets when muted (every 20ms)
+            while keepalive_running.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+                if !keepalive_running.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Only send keepalive when muted (normal audio TX handles unmuted case)
+                if !keepalive_muted.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                let current_seq = seq.fetch_add(1, Ordering::Relaxed);
+                let current_ts = ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
+
+                let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
+                let mut packet = header.to_bytes();
+
+                if let Ok(mut enc) = keepalive_encoder.lock() {
+                    enc.encode(&silence_pcm, &mut packet);
+                }
+
+                #[cfg(feature = "srtp")]
+                let send_packet = if let Some(ref srtp_ctx) = keepalive_srtp {
+                    match srtp_ctx.lock() {
+                        Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
+                        Err(_) => packet,
+                    }
+                } else {
+                    packet
+                };
+
+                #[cfg(not(feature = "srtp"))]
+                let send_packet = packet;
+
+                keepalive_counters.record_sent(send_packet.len() as u64);
+
+                let dest = keepalive_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
+                let _ = keepalive_socket.send_to(&send_packet, dest).await;
+            }
+        });
+    });
 
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -465,9 +562,7 @@ fn run_audio_rx(
     use std::collections::VecDeque;
 
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| Error::device("No output device"))?;
+    let device = host.default_output_device().ok_or_else(|| Error::device("No output device"))?;
 
     let default_config = device
         .default_output_config()
@@ -484,9 +579,8 @@ fn run_audio_rx(
 
     let codec_rate = 8000u32;
 
-    let sample_buffer: Arc<std::sync::Mutex<VecDeque<f32>>> = Arc::new(std::sync::Mutex::new(
-        VecDeque::with_capacity(native_rate as usize),
-    ));
+    let sample_buffer: Arc<std::sync::Mutex<VecDeque<f32>>> =
+        Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(native_rate as usize)));
     let rx_buffer = sample_buffer.clone();
 
     let stream = device
@@ -508,9 +602,7 @@ fn run_audio_rx(
         )
         .map_err(|e| Error::device(format!("Failed to build output stream: {}", e)))?;
 
-    stream
-        .play()
-        .map_err(|e| Error::device(format!("Failed to start output: {}", e)))?;
+    stream.play().map_err(|e| Error::device(format!("Failed to start output: {}", e)))?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -691,9 +783,7 @@ async fn run_rtcp(
             #[cfg(feature = "srtp")]
             let rtcp_data: Vec<u8> = if let Some(ref srtp_ctx) = _srtp {
                 match srtp_ctx.lock() {
-                    Ok(mut ctx) => ctx
-                        .unprotect_rtcp(&buf[..len])
-                        .unwrap_or_else(|_| buf[..len].to_vec()),
+                    Ok(mut ctx) => ctx.unprotect_rtcp(&buf[..len]).unwrap_or_else(|_| buf[..len].to_vec()),
                     Err(_) => buf[..len].to_vec(),
                 }
             } else {
@@ -704,8 +794,7 @@ async fn run_rtcp(
             let rtcp_data: Vec<u8> = buf[..len].to_vec();
 
             if rtcp_data.len() >= 8 && (rtcp_data[1] == 200 || rtcp_data[1] == 201) {
-                remote_ssrc =
-                    u32::from_be_bytes([rtcp_data[4], rtcp_data[5], rtcp_data[6], rtcp_data[7]]);
+                remote_ssrc = u32::from_be_bytes([rtcp_data[4], rtcp_data[5], rtcp_data[6], rtcp_data[7]]);
             }
         }
     }
@@ -730,7 +819,7 @@ mod tests {
         // Try to bind to a privileged port (requires root)
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         let result = MediaSession::start(80, remote, CodecType::Pcmu).await;
-
+        
         // Should fail on non-root systems
         // This tests error handling path
         if result.is_err() {
@@ -743,10 +832,10 @@ mod tests {
         // Use a random high port to avoid conflicts
         let port = 50000 + (rand::random::<u16>() % 10000);
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
-
+        
         // This will fail in CI without audio devices, but tests the creation path
         let result = MediaSession::start(port, remote, CodecType::Pcmu).await;
-
+        
         // In environments without audio, this fails at device setup
         // In environments with audio, it succeeds
         // Either way, we're testing the code path
@@ -760,8 +849,7 @@ mod tests {
                 // Expected on CI without audio devices
                 assert!(
                     matches!(e, Error::Device(_)) || matches!(e, Error::Network(_)),
-                    "Unexpected error type: {:?}",
-                    e
+                    "Unexpected error type: {:?}", e
                 );
             }
         }
@@ -771,7 +859,7 @@ mod tests {
     fn test_rtp_counters_initialization() {
         let counters = RtpCounters::new("PCMU");
         let stats = counters.snapshot();
-
+        
         assert_eq!(stats.packets_sent, 0);
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.packets_received, 0);
@@ -790,14 +878,14 @@ mod tests {
         // Test encoder creation
         let encoder = create_encoder(CodecType::Pcmu);
         assert!(encoder.is_ok());
-
+        
         let encoder = create_encoder(CodecType::Pcma);
         assert!(encoder.is_ok());
-
+        
         // Test decoder creation
         let decoder = create_decoder(CodecType::Pcmu);
         assert!(decoder.is_ok());
-
+        
         let decoder = create_decoder(CodecType::Pcma);
         assert!(decoder.is_ok());
     }
@@ -806,16 +894,14 @@ mod tests {
     #[test]
     fn test_srtp_context_for_session() {
         use crate::srtp::SrtpContext;
-
+        
         let (_ctx, key) = SrtpContext::generate().unwrap();
         assert!(!key.is_empty());
-
+        
         // Context should be able to protect/unprotect
-        let mut test_rtp = vec![
-            0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x12, 0x34, 0x56, 0x78,
-        ];
+        let mut test_rtp = vec![0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x12, 0x34, 0x56, 0x78];
         test_rtp.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-
+        
         let mut ctx_clone = SrtpContext::from_base64(&key).unwrap();
         let protected = ctx_clone.protect_rtp(&test_rtp);
         assert!(protected.is_ok());
