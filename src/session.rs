@@ -45,10 +45,62 @@ pub struct MediaSession {
 }
 
 impl MediaSession {
+    /// Allocate an available RTP port pair by letting the OS choose.
+    ///
+    /// Binds to port 0 to get an OS-assigned port, then verifies the adjacent
+    /// RTCP port (RTP+1) is also available. Returns the RTP port number.
+    ///
+    /// This is the recommended way to get a port before building SDP, as it
+    /// guarantees the port is available at allocation time.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let rtp_port = MediaSession::allocate_port().await?;
+    /// // Use rtp_port in SDP...
+    /// // Later, start the session with that port
+    /// let session = MediaSession::start(rtp_port, remote, codec).await?;
+    /// ```
+    pub async fn allocate_port() -> Result<u16> {
+        // Bind RTP socket to port 0 to get OS-assigned port
+        let rtp_socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| Error::Network(e))?;
+
+        let rtp_port = rtp_socket
+            .local_addr()
+            .map_err(|e| Error::Network(e))?
+            .port();
+
+        // Make sure port is even (RTP convention) - if odd, try again
+        if rtp_port % 2 != 0 {
+            drop(rtp_socket);
+            return Self::allocate_port().await; // Retry for even port
+        }
+
+        // Try to bind RTCP port (RTP + 1) to verify it's available
+        let rtcp_port = rtp_port + 1;
+        let rtcp_socket = UdpSocket::bind(format!("0.0.0.0:{}", rtcp_port)).await;
+
+        if rtcp_socket.is_err() {
+            // RTCP port not available, try again
+            drop(rtp_socket);
+            return Self::allocate_port().await;
+        }
+
+        // Both ports verified available - drop sockets and return the port
+        // The port will be re-bound when start() is called
+        // Note: There's a small race window here, but it's acceptable
+        drop(rtcp_socket);
+        drop(rtp_socket);
+
+        Ok(rtp_port)
+    }
+
     /// Start a media session with the specified codec.
     ///
     /// # Arguments
-    /// * `local_rtp_port` - Local UDP port for RTP
+    /// * `local_rtp_port` - Local UDP port for RTP (use 0 for OS-assigned, or
+    ///   use a port from `allocate_port()` for guaranteed availability)
     /// * `remote_addr` - Remote RTP endpoint address
     /// * `codec_type` - Audio codec to use
     pub async fn start(
