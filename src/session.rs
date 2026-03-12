@@ -8,12 +8,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 
-use crate::codec::{AudioDecoder, AudioEncoder, CodecType, create_decoder, create_encoder};
+use crate::codec::CodecType;
+#[cfg(feature = "device")]
+use crate::codec::{AudioDecoder, AudioEncoder, create_decoder, create_encoder};
 use crate::error::{Error, Result};
 use crate::recorder::{CallRecorder, RecorderHandle};
 #[cfg(feature = "device")]
 use crate::resample::{StreamResampler, f32_to_i16, i16_to_f32, resample_linear};
-use crate::rtp::{RtpCounters, RtpHeader, RtpStats, build_rtcp_rr, build_rtcp_sr};
+#[cfg(feature = "device")]
+use crate::rtp::RtpHeader;
+use crate::rtp::{RtpCounters, RtpStats, build_rtcp_rr, build_rtcp_sr};
 #[cfg(feature = "device")]
 use crate::rtp::{parse_rtp, parse_sequence, parse_timestamp};
 
@@ -188,7 +192,9 @@ impl MediaSession {
         let rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>> =
             Arc::new(std::sync::Mutex::new(None));
 
+        #[cfg(feature = "device")]
         let encoder = create_encoder(codec_type)?;
+        #[cfg(feature = "device")]
         let decoder = create_decoder(codec_type)?;
 
         // SRTP contexts: TX for outgoing (protect), RX for incoming (unprotect)
