@@ -20,6 +20,36 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
+    /// Start capturing audio from a named input device.
+    ///
+    /// If `device_name` is None, uses the system default.
+    pub fn start_with_device_name(device_name: Option<&str>) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = match device_name {
+            Some(name) => {
+                let mut found = None;
+                if let Ok(devices) = host.input_devices() {
+                    for d in devices {
+                        if let Ok(desc) = d.description() {
+                            if desc.name() == name {
+                                found = Some(d);
+                                break;
+                            }
+                        }
+                    }
+                }
+                found.or_else(|| {
+                    log::warn!("Input device '{}' not found, using default", name);
+                    host.default_input_device()
+                })
+            }
+            None => host.default_input_device(),
+        }
+        .ok_or_else(|| Error::device("No input audio device"))?;
+
+        Self::start_from_device(device)
+    }
+
     /// Start capturing audio from the default input device.
     ///
     /// Samples are buffered internally and can be retrieved with `read_samples()`.
@@ -29,6 +59,10 @@ impl AudioCapture {
             .default_input_device()
             .ok_or_else(|| Error::device("No input audio device"))?;
 
+        Self::start_from_device(device)
+    }
+
+    fn start_from_device(device: cpal::Device) -> Result<Self> {
         let config = device
             .default_input_config()
             .map_err(|e| Error::device(format!("No default input config: {}", e)))?;
@@ -133,6 +167,36 @@ pub struct AudioPlayback {
 }
 
 impl AudioPlayback {
+    /// Start audio playback to a named output device.
+    ///
+    /// If `device_name` is None, uses the system default.
+    pub fn start_with_device_name(device_name: Option<&str>) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = match device_name {
+            Some(name) => {
+                let mut found = None;
+                if let Ok(devices) = host.output_devices() {
+                    for d in devices {
+                        if let Ok(desc) = d.description() {
+                            if desc.name() == name {
+                                found = Some(d);
+                                break;
+                            }
+                        }
+                    }
+                }
+                found.or_else(|| {
+                    log::warn!("Output device '{}' not found, using default", name);
+                    host.default_output_device()
+                })
+            }
+            None => host.default_output_device(),
+        }
+        .ok_or_else(|| Error::device("No output audio device"))?;
+
+        Self::start_from_device(device)
+    }
+
     /// Start audio playback to the default output device.
     ///
     /// Samples can be written with `write_samples()`.
@@ -142,6 +206,10 @@ impl AudioPlayback {
             .default_output_device()
             .ok_or_else(|| Error::device("No output audio device"))?;
 
+        Self::start_from_device(device)
+    }
+
+    fn start_from_device(device: cpal::Device) -> Result<Self> {
         let config = device
             .default_output_config()
             .map_err(|e| Error::device(format!("No default output config: {}", e)))?;

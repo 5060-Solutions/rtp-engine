@@ -120,7 +120,39 @@ impl MediaSession {
         remote_addr: SocketAddr,
         codec_type: CodecType,
     ) -> Result<Self> {
-        Self::start_internal(local_rtp_port, remote_addr, codec_type, None, None).await
+        Self::start_internal(
+            local_rtp_port,
+            remote_addr,
+            codec_type,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Start a media session with specific audio devices.
+    ///
+    /// Pass device names (from `list_all_devices()`) to route audio to specific
+    /// input/output devices. Pass `None` for either to use the system default.
+    pub async fn start_with_devices(
+        local_rtp_port: u16,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<Self> {
+        Self::start_internal(
+            local_rtp_port,
+            remote_addr,
+            codec_type,
+            None,
+            None,
+            input_device,
+            output_device,
+        )
+        .await
     }
 
     /// Start a media session with SRTP encryption (single key for both directions).
@@ -139,6 +171,8 @@ impl MediaSession {
             remote_addr,
             codec_type,
             Some(srtp_ctx),
+            None,
+            None,
             None,
         )
         .await
@@ -163,6 +197,31 @@ impl MediaSession {
             codec_type,
             Some(tx_srtp_ctx),
             Some(rx_srtp_ctx),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Start a media session with SRTP and specific audio devices.
+    #[cfg(feature = "srtp")]
+    pub async fn start_with_srtp_keys_and_devices(
+        local_rtp_port: u16,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        tx_srtp_ctx: SrtpContext,
+        rx_srtp_ctx: SrtpContext,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<Self> {
+        Self::start_internal(
+            local_rtp_port,
+            remote_addr,
+            codec_type,
+            Some(tx_srtp_ctx),
+            Some(rx_srtp_ctx),
+            input_device,
+            output_device,
         )
         .await
     }
@@ -173,6 +232,8 @@ impl MediaSession {
         codec_type: CodecType,
         #[allow(unused_variables)] tx_srtp_ctx: Option<SrtpContext>,
         #[allow(unused_variables)] rx_srtp_ctx: Option<SrtpContext>,
+        #[allow(unused_variables)] input_device_name: Option<String>,
+        #[allow(unused_variables)] output_device_name: Option<String>,
     ) -> Result<Self> {
         let rtp_socket = UdpSocket::bind(format!("0.0.0.0:{}", local_rtp_port))
             .await
@@ -244,6 +305,7 @@ impl MediaSession {
             let tx_srtp_ctx = tx_srtp.clone();
             let tx_recorder = tx_recorder_handle.clone();
 
+            let tx_input_device = input_device_name.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_tx(
                     tx_socket,
@@ -256,6 +318,7 @@ impl MediaSession {
                     tx_learned,
                     tx_srtp_ctx,
                     tx_recorder,
+                    tx_input_device,
                 ) {
                     log::error!("Audio TX error: {}", e);
                 }
@@ -272,6 +335,7 @@ impl MediaSession {
             let rx_srtp_ctx = rx_srtp.clone();
             let rx_recorder = rx_recorder_handle.clone();
 
+            let rx_output_device = output_device_name;
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_rx(
                     rx_socket,
@@ -281,6 +345,7 @@ impl MediaSession {
                     rx_learned,
                     rx_srtp_ctx,
                     rx_recorder,
+                    rx_output_device,
                 ) {
                     log::error!("Audio RX error: {}", e);
                 }
@@ -565,13 +630,32 @@ fn run_audio_tx(
     learned_remote: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     _srtp: Option<SharedSrtp>,
     recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
+    input_device_name: Option<String>,
 ) -> Result<()> {
     use std::sync::atomic::AtomicU16;
 
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| Error::device("No input device"))?;
+    let device = match &input_device_name {
+        Some(name) => {
+            let mut found = None;
+            if let Ok(devices) = host.input_devices() {
+                for d in devices {
+                    if let Ok(desc) = d.description() {
+                        if desc.name() == name.as_str() {
+                            found = Some(d);
+                            break;
+                        }
+                    }
+                }
+            }
+            found.or_else(|| {
+                log::warn!("Input device '{}' not found, using default", name);
+                host.default_input_device()
+            })
+        }
+        None => host.default_input_device(),
+    }
+    .ok_or_else(|| Error::device("No input device"))?;
 
     let default_config = device
         .default_input_config()
@@ -884,13 +968,32 @@ fn run_audio_rx(
     learned_remote: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     _srtp: Option<SharedSrtp>,
     recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
+    output_device_name: Option<String>,
 ) -> Result<()> {
     use std::collections::VecDeque;
 
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| Error::device("No output device"))?;
+    let device = match &output_device_name {
+        Some(name) => {
+            let mut found = None;
+            if let Ok(devices) = host.output_devices() {
+                for d in devices {
+                    if let Ok(desc) = d.description() {
+                        if desc.name() == name.as_str() {
+                            found = Some(d);
+                            break;
+                        }
+                    }
+                }
+            }
+            found.or_else(|| {
+                log::warn!("Output device '{}' not found, using default", name);
+                host.default_output_device()
+            })
+        }
+        None => host.default_output_device(),
+    }
+    .ok_or_else(|| Error::device("No output device"))?;
 
     let default_config = device
         .default_output_config()
