@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 
 use crate::codec::CodecType;
@@ -54,6 +54,10 @@ pub struct MediaSession {
     /// Conference mode flag - when enabled, audio from this session
     /// participates in multi-party mixing
     conference_mode: Arc<AtomicBool>,
+    /// Current microphone audio level (RMS, stored as f32 bits in AtomicU32)
+    tx_level: Arc<AtomicU32>,
+    /// Current speaker audio level (RMS, stored as f32 bits in AtomicU32)
+    rx_level: Arc<AtomicU32>,
 }
 
 impl MediaSession {
@@ -253,6 +257,10 @@ impl MediaSession {
         let rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>> =
             Arc::new(std::sync::Mutex::new(None));
 
+        // Audio level meters (RMS stored as f32 bits)
+        let tx_level = Arc::new(AtomicU32::new(0));
+        let rx_level = Arc::new(AtomicU32::new(0));
+
         #[cfg(feature = "device")]
         let encoder = create_encoder(codec_type)?;
         #[cfg(feature = "device")]
@@ -306,6 +314,7 @@ impl MediaSession {
             let tx_recorder = tx_recorder_handle.clone();
 
             let tx_input_device = input_device_name.clone();
+            let tx_level_ref = tx_level.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_tx(
                     tx_socket,
@@ -319,6 +328,7 @@ impl MediaSession {
                     tx_srtp_ctx,
                     tx_recorder,
                     tx_input_device,
+                    tx_level_ref,
                 ) {
                     log::error!("Audio TX error: {}", e);
                 }
@@ -336,6 +346,7 @@ impl MediaSession {
             let rx_recorder = rx_recorder_handle.clone();
 
             let rx_output_device = output_device_name;
+            let rx_level_ref = rx_level.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_rx(
                     rx_socket,
@@ -346,6 +357,7 @@ impl MediaSession {
                     rx_srtp_ctx,
                     rx_recorder,
                     rx_output_device,
+                    rx_level_ref,
                 ) {
                     log::error!("Audio RX error: {}", e);
                 }
@@ -392,6 +404,8 @@ impl MediaSession {
             tx_recorder_handle,
             rx_recorder_handle,
             conference_mode: Arc::new(AtomicBool::new(false)),
+            tx_level,
+            rx_level,
         })
     }
 
@@ -490,6 +504,16 @@ impl MediaSession {
     /// Get current statistics.
     pub fn stats(&self) -> RtpStats {
         self.counters.snapshot()
+    }
+
+    /// Get the current microphone audio level (RMS, 0.0-1.0).
+    pub fn tx_audio_level(&self) -> f32 {
+        f32::from_bits(self.tx_level.load(Ordering::Relaxed))
+    }
+
+    /// Get the current speaker/received audio level (RMS, 0.0-1.0).
+    pub fn rx_audio_level(&self) -> f32 {
+        f32::from_bits(self.rx_level.load(Ordering::Relaxed))
     }
 
     /// Get the codec in use.
@@ -631,6 +655,7 @@ fn run_audio_tx(
     _srtp: Option<SharedSrtp>,
     recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     input_device_name: Option<String>,
+    tx_level: Arc<AtomicU32>,
 ) -> Result<()> {
     use std::sync::atomic::AtomicU16;
 
@@ -741,9 +766,10 @@ fn run_audio_tx(
                 while buffer.len() >= native_samples_per_frame {
                     let chunk: Vec<f32> = buffer.drain(..native_samples_per_frame).collect();
 
-                    // Calculate audio level for debugging (RMS)
+                    // Calculate audio level (RMS) and store for level meter
                     let rms: f32 =
                         (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+                    tx_level.store(rms.to_bits(), Ordering::Relaxed);
 
                     // Use persistent streaming resampler for glitch-free audio
                     let resampled = match cb_resampler.lock() {
@@ -969,6 +995,7 @@ fn run_audio_rx(
     _srtp: Option<SharedSrtp>,
     recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     output_device_name: Option<String>,
+    rx_level: Arc<AtomicU32>,
 ) -> Result<()> {
     use std::collections::VecDeque;
 
@@ -1206,6 +1233,13 @@ fn run_audio_rx(
                         }
 
                         let f32_samples = i16_to_f32(&pcm);
+                        // Calculate RX audio level (RMS) for level meter
+                        if !f32_samples.is_empty() {
+                            let rms: f32 = (f32_samples.iter().map(|s| s * s).sum::<f32>()
+                                / f32_samples.len() as f32)
+                                .sqrt();
+                            rx_level.store(rms.to_bits(), Ordering::Relaxed);
+                        }
                         let resampled = rx_resampler.process(&f32_samples);
 
                         if let Ok(mut buffer) = sample_buffer.lock() {
