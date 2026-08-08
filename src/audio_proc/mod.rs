@@ -9,7 +9,7 @@
 //!
 //! Echo cancellation needs both signals: the microphone (near end) and whatever
 //! is being played (far end, the "render" signal) to subtract from it. Both
-//! callbacks live in [`crate::session`], which is what makes this feasible
+//! callbacks live in the media session, which is what makes this feasible
 //! here and not in the SIP layer above.
 
 pub mod frame;

@@ -1,5 +1,8 @@
 #!/bin/sh
-# Pre-commit hook: run cargo fmt and clippy checks
+# Pre-commit hook: run the same checks CI runs.
+#
+# Keep this in step with .github/workflows/ci.yml. Every check that only
+# exists in CI is one that gets discovered after a push instead of before it.
 
 set -e
 
@@ -14,6 +17,16 @@ echo "Running cargo clippy..."
 cargo clippy --all-features --all-targets 2>&1
 if [ $? -ne 0 ]; then
     echo "ERROR: cargo clippy failed. Fix the warnings above."
+    exit 1
+fi
+
+# Rustdoc catches things clippy does not -- a doc link to a private item
+# builds fine and fails `cargo doc -Dwarnings`, which is how the CI Docs job
+# broke while every other job was green.
+echo "Running cargo doc..."
+RUSTDOCFLAGS="-Dwarnings" cargo doc --all-features --no-deps
+if [ $? -ne 0 ]; then
+    echo "ERROR: cargo doc failed. Fix the warnings above."
     exit 1
 fi
 
