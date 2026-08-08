@@ -11,13 +11,76 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
 
+/// The cpal host, with COM guaranteed to outlive cpal's cached enumerator.
+///
+/// Every path into cpal must come through here. cpal caches one
+/// `IMMDeviceEnumerator` in a process-wide `OnceLock`, created on whichever
+/// thread asks first and marked `Send + Sync`, while the COM initialisation
+/// backing it is a *thread-local* whose `Drop` calls `CoUninitialize`. So the
+/// first thread to touch cpal owns the apartment, and when that thread exits
+/// the cached pointer dangles for the rest of the process. Later calls read its
+/// vtable and fault — `INVALID_POINTER_READ_c0000005` at `+0x19d`, identical
+/// from `EnumAudioEndpoints` and `GetDefaultAudioEndpoint`, because it is one
+/// dead pointer reached two ways.
+///
+/// It bites here because audio threads are per-call: the first call to end
+/// would otherwise poison audio for every call after it.
+///
+/// Routing every caller through one accessor is the point. A previous attempt
+/// primed only the two default-device helpers, and `list_devices` — which asks
+/// cpal directly, and runs first under the test harness — still created the
+/// enumerator on a thread that promptly exited. A single entry point cannot be
+/// bypassed by accident.
+pub(crate) fn host() -> cpal::Host {
+    prime_device_enumerator();
+    cpal::default_host()
+}
+
+/// Build cpal's cached enumerator on a thread that never exits, once.
+///
+/// The thread parks forever rather than being joined: its only job is to keep
+/// the COM apartment — and therefore the enumerator — alive. One parked thread
+/// per process is the price of device access that does not expire.
+///
+/// No-op away from Windows, where none of this applies.
+fn prime_device_enumerator() {
+    static PRIMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+    if !cfg!(windows) {
+        return;
+    }
+
+    PRIMED.get_or_init(|| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("rtp-engine-com".to_owned())
+            .spawn(move || {
+                // Enumerating is what constructs the cached enumerator; the
+                // result is irrelevant.
+                let _ = cpal::default_host().input_devices().map(Iterator::count);
+                let _ = ready_tx.send(());
+                loop {
+                    std::thread::park();
+                }
+            });
+
+        if let Err(e) = spawned {
+            log::warn!("Could not start the audio COM thread: {e}");
+            return;
+        }
+        if ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            log::warn!("Audio COM thread did not report ready; continuing anyway");
+        }
+    });
+}
+
 /// `Host::default_input_device`, but returns `None` instead of asking for a
 /// default that does not exist.
 ///
-/// Only meaningful where cpal's device enumeration works at all. On a Windows
-/// host that cannot service WASAPI, every cpal entry point faults inside
-/// `IMMDeviceEnumerator` regardless of which one you call, so this guard
-/// cannot rescue that case — see the ignored session tests.
+/// Requires a host from [`host()`], so that cpal's enumerator is valid.
 pub(crate) fn safe_default_input_device(host: &cpal::Host) -> Option<cpal::Device> {
     if !has_any(host.input_devices()) {
         log::warn!("No audio input devices present; not requesting a default one");
@@ -60,7 +123,7 @@ impl AudioCapture {
     ///
     /// If `device_name` is None, uses the system default.
     pub fn start_with_device_name(device_name: Option<&str>) -> Result<Self> {
-        let host = cpal::default_host();
+        let host = host();
         let device = match device_name {
             Some(name) => {
                 let mut found = None;
@@ -90,7 +153,7 @@ impl AudioCapture {
     ///
     /// Samples are buffered internally and can be retrieved with `read_samples()`.
     pub fn start() -> Result<Self> {
-        let host = cpal::default_host();
+        let host = host();
         let device = safe_default_input_device(&host)
             .ok_or_else(|| Error::device("No input audio device"))?;
 
@@ -206,7 +269,7 @@ impl AudioPlayback {
     ///
     /// If `device_name` is None, uses the system default.
     pub fn start_with_device_name(device_name: Option<&str>) -> Result<Self> {
-        let host = cpal::default_host();
+        let host = host();
         let device = match device_name {
             Some(name) => {
                 let mut found = None;
@@ -236,7 +299,7 @@ impl AudioPlayback {
     ///
     /// Samples can be written with `write_samples()`.
     pub fn start() -> Result<Self> {
-        let host = cpal::default_host();
+        let host = host();
         let device = safe_default_output_device(&host)
             .ok_or_else(|| Error::device("No output audio device"))?;
 
@@ -349,7 +412,7 @@ pub struct AudioDevices {
 
 /// Query available audio input devices (microphones).
 pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
-    let host = cpal::default_host();
+    let host = host();
     let default_name = safe_default_input_device(&host)
         .and_then(|d| d.description().ok())
         .map(|d| d.name().to_string());
@@ -369,7 +432,7 @@ pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
 
 /// Query available audio output devices (speakers).
 pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
-    let host = cpal::default_host();
+    let host = host();
     let default_name = safe_default_output_device(&host)
         .and_then(|d| d.description().ok())
         .map(|d| d.name().to_string());
@@ -397,7 +460,7 @@ pub fn list_all_devices() -> Result<AudioDevices> {
 
 /// Query available audio devices (legacy - returns combined list).
 pub fn list_devices() -> Result<Vec<String>> {
-    let host = cpal::default_host();
+    let host = host();
     let mut devices = Vec::new();
 
     if let Ok(input_devices) = host.input_devices() {
