@@ -11,72 +11,14 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
 
-/// Create cpal's cached device enumerator on a thread that never exits.
-///
-/// cpal caches one `IMMDeviceEnumerator` in a process-wide `OnceLock`, created
-/// on whichever thread asks first, and marks it `Send + Sync`. But the COM
-/// initialisation backing it is a *thread-local* whose `Drop` calls
-/// `CoUninitialize`. So when the creating thread exits, COM tears down its
-/// apartment and the cached pointer dangles — while every later call keeps
-/// reading its vtable. That is the `INVALID_POINTER_READ_c0000005` seen at
-/// `+0x19d` in both `EnumAudioEndpoints` and `GetDefaultAudioEndpoint`: the same
-/// dead pointer reached by two paths.
-///
-/// It matters here because audio threads are per-call. Without this, the first
-/// call to finish would invalidate audio device access for the rest of the
-/// process, and a later call would fault.
-///
-/// Priming from a parked thread means the apartment outlives every caller. The
-/// thread is deliberately never joined; one parked thread for the life of the
-/// process is the cost of a valid enumerator.
-///
-/// No-op away from Windows, where none of this applies.
-fn prime_device_enumerator() {
-    static PRIMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
-    if !cfg!(windows) {
-        return;
-    }
-
-    PRIMED.get_or_init(|| {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("rtp-engine-com".to_owned())
-            .spawn(move || {
-                // Touching the enumeration is what constructs cpal's cached
-                // enumerator; the result is irrelevant.
-                let host = cpal::default_host();
-                let _ = host.input_devices().map(Iterator::count);
-                let _ = ready_tx.send(());
-                loop {
-                    std::thread::park();
-                }
-            });
-
-        if let Err(e) = spawned {
-            log::warn!("Could not start the audio COM thread: {e}");
-            return;
-        }
-        // Wait for the enumerator to exist before any caller uses it. If the
-        // thread died first, carry on: the call was going to fault either way,
-        // and blocking forever here would be worse.
-        if ready_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .is_err()
-        {
-            log::warn!("Audio COM thread did not report ready; continuing anyway");
-        }
-    });
-}
-
 /// `Host::default_input_device`, but returns `None` instead of asking for a
 /// default that does not exist.
 ///
-/// Enumerating first is only meaningful once [`prime_device_enumerator`] has
-/// made the enumerator outlive its creator; before that, both this and
-/// enumeration read the same dangling pointer.
+/// Only meaningful where cpal's device enumeration works at all. On a Windows
+/// host that cannot service WASAPI, every cpal entry point faults inside
+/// `IMMDeviceEnumerator` regardless of which one you call, so this guard
+/// cannot rescue that case — see the ignored session tests.
 pub(crate) fn safe_default_input_device(host: &cpal::Host) -> Option<cpal::Device> {
-    prime_device_enumerator();
     if !has_any(host.input_devices()) {
         log::warn!("No audio input devices present; not requesting a default one");
         return None;
@@ -87,7 +29,6 @@ pub(crate) fn safe_default_input_device(host: &cpal::Host) -> Option<cpal::Devic
 /// `Host::default_output_device`, with the same guard as
 /// [`safe_default_input_device`].
 pub(crate) fn safe_default_output_device(host: &cpal::Host) -> Option<cpal::Device> {
-    prime_device_enumerator();
     if !has_any(host.output_devices()) {
         log::warn!("No audio output devices present; not requesting a default one");
         return None;
