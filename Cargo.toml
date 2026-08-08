@@ -139,5 +139,10 @@ env_logger = "0.11"
 # crate's own builds and tests -- Cargo ignores [patch] from a dependency, so a
 # consumer that wants `audio-proc` on Windows needs the same stanza in its own
 # workspace root. See https://github.com/tonarino/webrtc-audio-processing/pull/102
+#
+# Pinned to a revision rather than a branch: this crate does not commit its
+# Cargo.lock, so tracking a branch means CI can silently resolve a different
+# dependency on every run, and a cache hit can keep an old one long after the
+# branch moved.
 [patch.crates-io]
-webrtc-audio-processing-sys = { git = "https://github.com/5060-Solutions/webrtc-audio-processing.git", branch = "msvc-support" }
+webrtc-audio-processing-sys = { git = "https://github.com/5060-Solutions/webrtc-audio-processing.git", rev = "b3a2d7e" }
