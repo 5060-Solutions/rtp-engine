@@ -124,6 +124,18 @@ pub fn default_config() -> VoiceProcessorConfig {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Whether this build can do voice processing at all.
+///
+/// False when the crate was compiled without the `audio-proc` feature, in which
+/// case [`set_default_config`] will accept a configuration and quietly do
+/// nothing with it. A host with a settings screen should ask this before
+/// offering the user a switch — a control that claims to cancel echo and does
+/// not is worse than no control.
+#[must_use]
+pub const fn is_available() -> bool {
+    cfg!(feature = "audio-proc")
+}
+
 /// Which half of the duplex path a handle carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
