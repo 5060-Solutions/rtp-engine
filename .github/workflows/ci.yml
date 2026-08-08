@@ -25,12 +25,16 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
+      # meson and ninja build the bundled WebRTC audio processing C++ sources
+      # that the `audio-proc` feature needs. --all-features turns it on.
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libopus-dev meson ninja-build
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install opus
+        run: brew install opus meson ninja
       - name: Run tests
         run: cargo test --all-features
 
@@ -43,8 +47,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ALSA dev
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install ALSA dev and the audio-proc toolchain
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev meson ninja-build
       - name: Clippy
         run: cargo clippy --all-features --all-targets
 
@@ -66,8 +70,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install ALSA dev
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install ALSA dev and the audio-proc toolchain
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev meson ninja-build
       - name: Build docs
         run: cargo doc --all-features --no-deps
         env:

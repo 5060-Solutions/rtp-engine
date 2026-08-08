@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 
+use crate::audio_proc::VoiceProcessor;
 use crate::codec::CodecType;
 #[cfg(feature = "device")]
 use crate::codec::{AudioDecoder, AudioEncoder, create_decoder, create_encoder};
@@ -58,6 +59,10 @@ pub struct MediaSession {
     tx_level: Arc<AtomicU32>,
     /// Current speaker audio level (RMS, stored as f32 bits in AtomicU32)
     rx_level: Arc<AtomicU32>,
+    /// Echo cancellation and noise suppression, shared by the TX and RX threads.
+    /// Disabled unless the host called `audio_proc::set_default_config` and the
+    /// crate was built with the `audio-proc` feature.
+    voice: Arc<VoiceProcessor>,
 }
 
 impl MediaSession {
@@ -261,6 +266,12 @@ impl MediaSession {
         let tx_level = Arc::new(AtomicU32::new(0));
         let rx_level = Arc::new(AtomicU32::new(0));
 
+        // One voice processor per session, shared by the capture and playback
+        // threads — echo cancellation is only possible because both halves
+        // report to the same place. Snapshotted at session start so a settings
+        // change mid-call cannot reset the canceller's adapted state.
+        let voice = VoiceProcessor::from_default();
+
         #[cfg(feature = "device")]
         let encoder = create_encoder(codec_type)?;
         #[cfg(feature = "device")]
@@ -315,6 +326,7 @@ impl MediaSession {
 
             let tx_input_device = input_device_name.clone();
             let tx_level_ref = tx_level.clone();
+            let tx_voice = voice.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_tx(
                     tx_socket,
@@ -329,6 +341,7 @@ impl MediaSession {
                     tx_recorder,
                     tx_input_device,
                     tx_level_ref,
+                    tx_voice,
                 ) {
                     log::error!("Audio TX error: {}", e);
                 }
@@ -347,6 +360,7 @@ impl MediaSession {
 
             let rx_output_device = output_device_name;
             let rx_level_ref = rx_level.clone();
+            let rx_voice = voice.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_rx(
                     rx_socket,
@@ -358,6 +372,7 @@ impl MediaSession {
                     rx_recorder,
                     rx_output_device,
                     rx_level_ref,
+                    rx_voice,
                 ) {
                     log::error!("Audio RX error: {}", e);
                 }
@@ -406,7 +421,26 @@ impl MediaSession {
             conference_mode: Arc::new(AtomicBool::new(false)),
             tx_level,
             rx_level,
+            voice,
         })
+    }
+
+    /// Whether echo cancellation and noise suppression are running on this call.
+    ///
+    /// False when the crate was built without the `audio-proc` feature, when
+    /// the host never enabled it, or when the two audio devices could not agree
+    /// on a sample rate the canceller supports — the log says which. Worth
+    /// showing in a UI, so a user who turned echo cancellation on can tell
+    /// whether it actually started.
+    #[must_use]
+    pub fn voice_processing_active(&self) -> bool {
+        self.voice.is_active()
+    }
+
+    /// What voice processing this session was started with.
+    #[must_use]
+    pub fn voice_processing_config(&self) -> crate::audio_proc::VoiceProcessorConfig {
+        self.voice.config()
     }
 
     /// Send an RFC 2833 DTMF digit.
@@ -656,6 +690,7 @@ fn run_audio_tx(
     recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     input_device_name: Option<String>,
     tx_level: Arc<AtomicU32>,
+    voice: Arc<VoiceProcessor>,
 ) -> Result<()> {
     use std::sync::atomic::AtomicU16;
 
@@ -744,6 +779,13 @@ fn run_audio_tx(
     let first_audio_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cb_first_logged = first_audio_logged.clone();
 
+    // Echo cancellation and noise suppression, if the host enabled them. Owned
+    // by this callback: it holds the framing remainder, so it cannot be shared.
+    let mut capture_path = voice.capture_path(native_rate);
+    // Mute stops feeding the canceller. Tracked so the stale partial frame from
+    // before the mute is not spliced onto the first frame after it.
+    let mut was_muted = false;
+
     let stream = device
         .build_input_stream(
             &config,
@@ -754,8 +796,19 @@ fn run_audio_tx(
 
                 // When muted, skip mic data processing but let keepalive task send silence
                 if cb_muted.load(Ordering::Relaxed) {
+                    was_muted = true;
                     return;
                 }
+                if was_muted {
+                    was_muted = false;
+                    capture_path.reset();
+                }
+
+                // Cancel echo and suppress noise before anything else sees the
+                // audio, so the level meter, the recording and the far end all
+                // get the same cleaned signal. Returns fewer samples than it was
+                // given until the first 10 ms frame completes.
+                let data = capture_path.process(data);
 
                 let mut buffer = match sample_buffer.lock() {
                     Ok(b) => b,
@@ -985,6 +1038,54 @@ fn run_audio_tx(
     Ok(())
 }
 
+/// Fill one playback buffer from the jitter-smoothed sample queue.
+///
+/// Writes silence when there is nothing to play — while the pre-buffer fills,
+/// after an underrun, or if the queue lock is poisoned. Split out of the output
+/// callback so that every one of those paths still produces a full buffer of
+/// samples for the echo canceller's reference stream; when this was inline, the
+/// early returns skipped it.
+#[cfg(feature = "device")]
+fn fill_playback(
+    data: &mut [f32],
+    queue: &std::sync::Mutex<std::collections::VecDeque<f32>>,
+    playback_started: &AtomicBool,
+    pre_buffer_samples: usize,
+) {
+    let silence = |data: &mut [f32]| data.fill(0.0);
+
+    let Ok(mut buffer) = queue.lock() else {
+        silence(data);
+        return;
+    };
+
+    // Don't start draining until we have enough pre-buffered audio.
+    if !playback_started.load(Ordering::Relaxed) {
+        if buffer.len() < pre_buffer_samples {
+            silence(data);
+            return;
+        }
+        playback_started.store(true, Ordering::Relaxed);
+        log::info!(
+            "Audio RX: pre-buffer filled ({} samples), starting playback",
+            buffer.len()
+        );
+    }
+
+    // If the buffer runs dry, pause playback to re-buffer rather than emit a
+    // click on every callback.
+    if buffer.is_empty() {
+        playback_started.store(false, Ordering::Relaxed);
+        log::debug!("Audio RX: buffer underrun, re-buffering");
+        silence(data);
+        return;
+    }
+
+    for out in data.iter_mut() {
+        *out = buffer.pop_front().unwrap_or(0.0);
+    }
+}
+
 #[cfg(feature = "device")]
 fn run_audio_rx(
     socket: Arc<UdpSocket>,
@@ -996,6 +1097,7 @@ fn run_audio_rx(
     recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     output_device_name: Option<String>,
     rx_level: Arc<AtomicU32>,
+    voice: Arc<VoiceProcessor>,
 ) -> Result<()> {
     use std::collections::VecDeque;
 
@@ -1048,47 +1150,23 @@ fn run_audio_rx(
     let playback_started = Arc::new(AtomicBool::new(false));
     let pb_started = playback_started.clone();
 
+    // The echo canceller's reference signal. Owned by this callback for the
+    // same reason the capture path is owned by its own: it carries framing
+    // state across calls.
+    let mut render_path = voice.render_path(native_rate);
+
     let stream = device
         .build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if let Ok(mut buffer) = rx_buffer.lock() {
-                    // Don't start draining until we have enough pre-buffered audio
-                    if !pb_started.load(Ordering::Relaxed) {
-                        if buffer.len() >= pre_buffer_samples {
-                            pb_started.store(true, Ordering::Relaxed);
-                            log::info!(
-                                "Audio RX: pre-buffer filled ({} samples), starting playback",
-                                buffer.len()
-                            );
-                        } else {
-                            // Still buffering — output silence
-                            for out in data.iter_mut() {
-                                *out = 0.0;
-                            }
-                            return;
-                        }
-                    }
+                fill_playback(data, &rx_buffer, &pb_started, pre_buffer_samples);
 
-                    // If buffer runs critically low, pause playback to re-buffer
-                    // (avoids constant underrun clicks)
-                    if buffer.is_empty() {
-                        pb_started.store(false, Ordering::Relaxed);
-                        log::debug!("Audio RX: buffer underrun, re-buffering");
-                        for out in data.iter_mut() {
-                            *out = 0.0;
-                        }
-                        return;
-                    }
-
-                    for out in data.iter_mut() {
-                        *out = buffer.pop_front().unwrap_or(0.0);
-                    }
-                } else {
-                    for out in data.iter_mut() {
-                        *out = 0.0;
-                    }
-                }
+                // Show the canceller exactly what the speaker is about to play,
+                // on every callback including the silent ones. A gap in this
+                // stream reads to the canceller as a change in the microphone-
+                // to-speaker delay and forces it to re-converge, which is
+                // audible as a burst of echo.
+                render_path.analyze(data);
             },
             |err| log::error!("Audio output error: {}", err),
             None,

@@ -86,6 +86,13 @@ g711 = []
 opus = ["dep:audiopus"]
 srtp = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1"]
 device = ["dep:cpal"]
+# Acoustic echo cancellation and noise suppression for desktop capture.
+#
+# Off by default: it builds WebRTC's audio processing module from C++ source,
+# which needs `meson`, `ninja` and a C++ toolchain on the build host. Mobile
+# must leave it off — Android and iOS already apply the platform's own echo
+# cancellation, and stacking a second one on top sounds worse than either.
+audio-proc = ["dep:webrtc-audio-processing"]
 
 [dependencies]
 # Core
@@ -98,6 +105,9 @@ rand = "0.10"
 
 # Audio device (optional)
 cpal = { version = "0.17", optional = true }
+
+# Echo cancellation / noise suppression (optional; builds C++ from source)
+webrtc-audio-processing = { version = "2.1", features = ["bundled"], optional = true }
 
 # High-quality audio resampling
 rubato = "1.0"
