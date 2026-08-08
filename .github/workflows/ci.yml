@@ -56,7 +56,14 @@ jobs:
       # --all-features turns on audio-proc, so this actually runs the echo
       # canceller on every platform rather than only proving it links.
       - name: Run tests
+        if: runner.os != 'Windows'
         run: cargo test --all-features
+      # Windows runs one test at a time and unbuffered. Native code that faults
+      # takes the whole harness process with it, and under the default parallel
+      # runner the output stops with no indication of which test was to blame.
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --all-features -- --test-threads=1 --nocapture
 
   clippy:
     name: Clippy
