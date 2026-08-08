@@ -67,6 +67,25 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --all-features -- --test-threads=1
 
+      # A native fault gives an exit code and nothing else, which is close to
+      # useless. cdb ships with the Windows SDK already on these runners, so on
+      # failure re-run under it and print the faulting stack.
+      - name: Faulting stack (Windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cdb = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $cdb) { Write-Host "cdb.exe not found"; exit 0 }
+          $exe = (cargo test --all-features --lib --no-run --message-format=json 2>$null |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
+            Where-Object { $_.executable } |
+            Select-Object -Last 1).executable
+          Write-Host "test binary: $exe"
+          & $cdb.FullName -c "g; !analyze -v; q" $exe --test-threads=1 2>&1 |
+            Select-String -Pattern "FAULTING_SOURCE|SYMBOL_NAME|FAILURE_BUCKET_ID|EXCEPTION_CODE|rtp_engine.*!|cpal::|windows::" |
+            Select-Object -First 40
+          exit 0
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
