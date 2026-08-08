@@ -21,6 +21,14 @@
 //! 1. It pulls in a C++ library that builds from source and needs `meson`,
 //!    `ninja` and a C++ toolchain present. That is a fine ask for a desktop
 //!    build and an unreasonable one for a library consumer who only wants RTP.
+//!
+//!    Windows needs two things beyond that, both learned the hard way:
+//!    build from a Visual Studio developer prompt so meson finds `cl.exe`
+//!    rather than mingw's `g++` (abseil does not compile against mingw's
+//!    `windows.foundation.h`), and set `CXXFLAGS=/std:c++20`, because WebRTC
+//!    uses designated initializers that MSVC rejects under the C++17 the
+//!    vendored `meson.build` asks for. GCC and Clang accept them as an
+//!    extension, so only Windows trips on it.
 //! 2. Mobile must not enable it. Android's `VOICE_COMMUNICATION` source and
 //!    iOS's `.voiceChat` mode already apply the platform's own AEC, tuned to
 //!    that specific hardware. A second canceller stacked on a tuned one sounds
