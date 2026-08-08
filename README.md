@@ -246,36 +246,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Echo Cancellation and Noise Suppression
 
-`audio-proc` is off by default because it builds WebRTC's audio processing
-module from C++ source, and because mobile should not use it — Android's
-`VOICE_COMMUNICATION` and iOS's `.voiceChat` already apply the platform's own
-canceller, and a second one stacked on a tuned one sounds worse than either.
-
-Enable it, set what you want, and the session picks it up:
-
 ```rust
 use rtp_engine::audio_proc::{self, VoiceProcessorConfig};
 
 audio_proc::set_default_config(VoiceProcessorConfig::desktop_default());
 ```
 
-`MediaSession::voice_processing_active()` reports whether it actually started.
-It can be false with everything configured — most often because the capture and
-playback devices run at different sample rates, which one canceller cannot
-bridge. Surface it rather than assuming.
+Sessions started afterwards pick it up.
+`MediaSession::voice_processing_active()` reports whether it actually started —
+it can be false with everything configured, usually because the capture and
+playback devices run at different sample rates. Show that rather than assume.
 
-Build requirements:
+Off by default: it builds WebRTC's audio processing module from C++ source, so
+it needs `meson` and `ninja`. Mobile should leave it off — Android and iOS
+already apply the platform's own canceller, and stacking a second on a tuned
+one sounds worse than either.
 
-| Platform | Needs |
-|----------|-------|
-| Linux | `meson`, `ninja` (`apt install meson ninja-build`) |
-| macOS | `meson`, `ninja` (`brew install meson ninja`) |
-| Windows | `meson`, `ninja`, **a Visual Studio developer prompt** so meson finds `cl.exe` instead of mingw's `g++`, and `CXXFLAGS=/std:c++20` |
-
-The two Windows extras are not optional: abseil does not compile against
-mingw's `windows.foundation.h`, and WebRTC uses designated initializers that
-MSVC rejects under the C++17 the vendored `meson.build` requests. GCC and Clang
-accept those as an extension, so only Windows trips on either.
+Windows needs a Visual Studio developer prompt (otherwise meson finds mingw's
+`g++`, which abseil will not compile against) and a patched
+`webrtc-audio-processing-sys` — upstream 2.1.0 passes GCC flag syntax to MSVC.
+See [5060-Solutions/webrtc-audio-processing](https://github.com/5060-Solutions/webrtc-audio-processing/tree/msvc-support).
 
 ### Minimal Build
 
