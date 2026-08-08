@@ -19,12 +19,14 @@ use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
 /// `INVALID_POINTER_READ_c0000005`, reached through
 /// `cpal::host::wasapi::device::default_device`.
 ///
-/// Enumeration handles the empty case correctly, so checking whether any device
-/// exists avoids the call entirely on the machine where it would crash.
-/// Elsewhere this costs one extra enumeration and gives the same answer.
+/// Note that enumeration is **not** a safe substitute: `EnumAudioEndpoints`
+/// faults the same way, at the same vtable read, so this guard does not rescue
+/// a Windows host with no endpoints at all. It does give a clean `None` on
+/// every other platform, and on Windows hosts where COM is healthy.
 ///
-/// Without it, a Windows user with no microphone crashes the application when a
-/// call starts, rather than being told there is no input device.
+/// The underlying fault looks like a failed `CoCreateInstance` whose result
+/// cpal uses regardless: both crashes land at `+0x19d`, the vtable read, with
+/// an invalid interface pointer.
 pub(crate) fn safe_default_input_device(host: &cpal::Host) -> Option<cpal::Device> {
     if !has_any(host.input_devices()) {
         log::warn!("No audio input devices present; not requesting a default one");
