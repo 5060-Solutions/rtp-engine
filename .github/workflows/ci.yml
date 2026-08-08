@@ -61,6 +61,27 @@ jobs:
       # Windows runs one test at a time and unbuffered. Native code that faults
       # takes the whole harness process with it, and under the default parallel
       # runner the output stops with no indication of which test was to blame.
+      # TEMPORARY. Diagnosing a STATUS_ACCESS_VIOLATION that only appears on
+      # Windows, in the SRTP tests, with or without the C++ audio dependency.
+      # rtp-engine denies unsafe_code and the SRTP module holds no unbounded
+      # state, so the fault has to come from a dependency's unsafe code. This
+      # answers three things at once: whether it is deterministic, whether it
+      # survives optimisation, and whether it needs anything beyond the crypto
+      # crates. Remove once the cause is known.
+      - name: Diagnose the Windows SRTP fault
+        if: runner.os == 'Windows'
+        shell: bash
+        continue-on-error: true
+        run: |
+          for i in 1 2 3; do
+            echo "===== debug run $i ====="
+            cargo test --lib srtp -- --test-threads=1 --nocapture 2>&1 | tail -6 || true
+          done
+          echo "===== release ====="
+          cargo test --release --lib srtp -- --test-threads=1 --nocapture 2>&1 | tail -6 || true
+          echo "===== srtp feature only, no opus/cpal ====="
+          cargo test --no-default-features --features srtp --lib srtp -- --test-threads=1 --nocapture 2>&1 | tail -6 || true
+
       # Default features first, so a Windows failure can be attributed. The
       # SRTP rollover test faults here with STATUS_ACCESS_VIOLATION; running it
       # without audio-proc establishes whether the C++ dependency is involved
