@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +35,21 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install opus meson ninja
+      - name: Install Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: pip install meson ninja
+      # Without this meson finds mingw's g++ first, and abseil-cpp does not
+      # compile against mingw's windows.foundation.h.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      # --all-features turns on audio-proc, so this actually runs the echo
+      # canceller on every platform rather than only proving it links.
       - name: Run tests
         run: cargo test --all-features
 

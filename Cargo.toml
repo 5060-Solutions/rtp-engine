@@ -133,3 +133,11 @@ tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sy
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
 env_logger = "0.11"
+
+# Upstream 2.1.0 does not build for windows-msvc and mis-detects the
+# architecture when cross-compiling for Apple targets. This only affects this
+# crate's own builds and tests -- Cargo ignores [patch] from a dependency, so a
+# consumer that wants `audio-proc` on Windows needs the same stanza in its own
+# workspace root. See https://github.com/tonarino/webrtc-audio-processing/pull/102
+[patch.crates-io]
+webrtc-audio-processing-sys = { git = "https://github.com/5060-Solutions/webrtc-audio-processing.git", branch = "msvc-support" }
