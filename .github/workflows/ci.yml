@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # audiopus_sys vendors an Opus tree whose cmake_minimum_required predates what
+  # CMake 4 will accept. Nothing to do with this crate; it just surfaced when
+  # Windows joined the matrix, since the other runners resolve Opus through a
+  # system package instead of building it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   test:
