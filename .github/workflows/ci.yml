@@ -75,15 +75,39 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         continue-on-error: true
+        env:
+          # Override the workflow-wide -Dwarnings: the force-soft probe below
+          # passes cfgs the crates may not declare, and an unexpected_cfgs
+          # warning would fail the build before it could tell us anything.
+          RUSTFLAGS: ""
         run: |
-          foreach ($i in 1..3) {
-            Write-Host "===== debug run $i ====="
-            cargo test --lib srtp -- --test-threads=1 --nocapture 2>&1 | Select-Object -Last 5
-          }
-          Write-Host "===== release ====="
-          cargo test --release --lib srtp -- --test-threads=1 --nocapture 2>&1 | Select-Object -Last 5
-          Write-Host "===== srtp feature only, no opus/cpal ====="
-          cargo test --no-default-features --features srtp --lib srtp -- --test-threads=1 --nocapture 2>&1 | Select-Object -Last 5
+          # The srtp tests pass 23/23 in isolation, in both profiles. With
+          # --test-threads=1 tests run alphabetically and srtp sits near the
+          # end, so it was merely what was on screen when the process died.
+          # `device` runs earlier and drives cpal, meaning WASAPI and COM on a
+          # runner with no audio hardware -- the obvious suspect.
+
+          Write-Host "===== device tests alone ====="
+          cargo test --lib device -- --test-threads=1 2>&1 | Select-Object -Last 4
+
+          Write-Host "===== whole suite, skipping device ====="
+          cargo test --lib -- --test-threads=1 --skip device 2>&1 | Select-Object -Last 4
+
+          Write-Host "===== whole suite, unmodified (expected to fault) ====="
+          cargo test --lib -- --test-threads=1 2>&1 | Select-Object -Last 4
+
+          # Which frame actually faults. cdb ships with the Windows SDK already
+          # present on these runners.
+          Write-Host "===== faulting stack under cdb ====="
+          $cdb = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $cdb) { Write-Host "cdb.exe not found; skipping"; exit 0 }
+          $exe = (cargo test --lib --no-run --message-format=json 2>$null |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
+            Where-Object { $_.executable } |
+            Select-Object -Last 1).executable
+          Write-Host "test binary: $exe"
+          & $cdb.FullName -c "g; .echo ===FAULT===; !analyze -v; kb; q" $exe --test-threads=1 2>&1 |
+            Select-Object -Last 80
           exit 0
 
       # Default features first, so a Windows failure can be attributed. The
