@@ -1467,7 +1467,23 @@ mod tests {
         }
     }
 
+    /// Needs a real audio device on Windows, hence the conditional ignore.
+    ///
+    /// Starting a session spawns the capture and playback threads, and cpal's
+    /// WASAPI backend does not degrade gracefully on a host with no audio
+    /// endpoints: it faults reading the vtable of an `IMMDeviceEnumerator` that
+    /// `CoCreateInstance` never produced. Both `EnumAudioEndpoints` and
+    /// `GetDefaultAudioEndpoint` do it, so there is no call we can make from
+    /// safe Rust to ask first — confirmed under cdb, `+0x19d` in each.
+    ///
+    /// Because the fault happens on a spawned thread it also lands on whatever
+    /// test is running at the time, which is why it spent a while looking like
+    /// an SRTP bug. Run it with `--ignored` on a machine that has a microphone.
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "cpal's WASAPI backend faults without audio hardware"
+    )]
     async fn test_media_session_basic_creation() {
         // Use a random high port to avoid conflicts
         let port = 50000 + (rand::random::<u16>() % 10000);

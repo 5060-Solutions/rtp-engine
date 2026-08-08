@@ -130,15 +130,6 @@ base64 = "0.22"
 # Async runtime for device threads
 tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sync", "macros"] }
 
-# cpal accepts windows >=0.59,<=0.62 and resolves to 0.62.2 on its own, where
-# its WASAPI backend faults on a host with no audio endpoints: the interface
-# pointer from CoCreateInstance is invalid and cpal reads its vtable anyway.
-# The softphone happens to resolve 0.61.3, because Tauri pins it there, and has
-# never shown this. Pinning the same version here tests whether that difference
-# is the reason, and keeps the library on the version the shipped app uses.
-[target.'cfg(windows)'.dependencies]
-windows = "0.61"
-
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
 env_logger = "0.11"
