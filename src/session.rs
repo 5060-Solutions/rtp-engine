@@ -1302,11 +1302,11 @@ async fn run_rtcp(
             let received = stats.packets_received;
             let expected = counters.expected_packets.load(Ordering::Relaxed);
             let lost = expected.saturating_sub(received);
-            let loss_fraction = if expected > 0 {
-                ((lost * 256) / expected) as u8
-            } else {
-                0
-            };
+            // checked_div rather than a guarded divide: clippy's
+            // manual_checked_ops flags the latter, and this says the same
+            // thing — no expected packets means no measurable loss.
+            #[allow(clippy::cast_possible_truncation)]
+            let loss_fraction = (lost * 256).checked_div(expected).unwrap_or(0) as u8;
             let rr = build_rtcp_rr(
                 ssrc,
                 remote_ssrc,

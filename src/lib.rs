@@ -50,6 +50,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+pub mod audio_proc;
 pub mod codec;
 pub mod error;
 pub mod jitter;
