@@ -61,6 +61,13 @@ jobs:
       # Windows runs one test at a time and unbuffered. Native code that faults
       # takes the whole harness process with it, and under the default parallel
       # runner the output stops with no indication of which test was to blame.
+      # Default features first, so a Windows failure can be attributed. The
+      # SRTP rollover test faults here with STATUS_ACCESS_VIOLATION; running it
+      # without audio-proc establishes whether the C++ dependency is involved
+      # at all, rather than assuming it is because it is the newest thing.
+      - name: Run tests, default features (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -- --test-threads=1
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
         run: cargo test --all-features -- --test-threads=1 --nocapture
