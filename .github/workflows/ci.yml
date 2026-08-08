@@ -55,71 +55,17 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
       # --all-features turns on audio-proc, so this actually runs the echo
       # canceller on every platform rather than only proving it links.
+      #
+      # Windows runs serially. Native code that faults takes the whole harness
+      # process with it, and under the parallel runner the output just stops
+      # with no indication of which test was to blame -- which cost several
+      # rounds when the WASAPI fault first appeared.
       - name: Run tests
         if: runner.os != 'Windows'
         run: cargo test --all-features
-      # Windows runs one test at a time and unbuffered. Native code that faults
-      # takes the whole harness process with it, and under the default parallel
-      # runner the output stops with no indication of which test was to blame.
-      # TEMPORARY. Diagnosing a STATUS_ACCESS_VIOLATION that only appears on
-      # Windows, in the SRTP tests, with or without the C++ audio dependency.
-      # rtp-engine denies unsafe_code and the SRTP module holds no unbounded
-      # state, so the fault has to come from a dependency's unsafe code. This
-      # answers three things at once: whether it is deterministic, whether it
-      # survives optimisation, and whether it needs anything beyond the crypto
-      # crates. Remove once the cause is known.
-      # pwsh, not bash: under bash, Git's /usr/bin precedes the MSVC toolchain
-      # on PATH and rustc invokes coreutils `link` instead of link.exe, which
-      # fails every build with "extra operand".
-      - name: Diagnose the Windows SRTP fault
-        if: runner.os == 'Windows'
-        shell: pwsh
-        continue-on-error: true
-        env:
-          # Override the workflow-wide -Dwarnings: the force-soft probe below
-          # passes cfgs the crates may not declare, and an unexpected_cfgs
-          # warning would fail the build before it could tell us anything.
-          RUSTFLAGS: ""
-        run: |
-          # The srtp tests pass 23/23 in isolation, in both profiles. With
-          # --test-threads=1 tests run alphabetically and srtp sits near the
-          # end, so it was merely what was on screen when the process died.
-          # `device` runs earlier and drives cpal, meaning WASAPI and COM on a
-          # runner with no audio hardware -- the obvious suspect.
-
-          Write-Host "===== device tests alone ====="
-          cargo test --lib device -- --test-threads=1 2>&1 | Select-Object -Last 4
-
-          Write-Host "===== whole suite, skipping device ====="
-          cargo test --lib -- --test-threads=1 --skip device 2>&1 | Select-Object -Last 4
-
-          Write-Host "===== whole suite, unmodified (expected to fault) ====="
-          cargo test --lib -- --test-threads=1 2>&1 | Select-Object -Last 4
-
-          # Which frame actually faults. cdb ships with the Windows SDK already
-          # present on these runners.
-          Write-Host "===== faulting stack under cdb ====="
-          $cdb = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $cdb) { Write-Host "cdb.exe not found; skipping"; exit 0 }
-          $exe = (cargo test --lib --no-run --message-format=json 2>$null |
-            ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
-            Where-Object { $_.executable } |
-            Select-Object -Last 1).executable
-          Write-Host "test binary: $exe"
-          & $cdb.FullName -c "g; .echo ===FAULT===; !analyze -v; kb; q" $exe --test-threads=1 2>&1 |
-            Select-Object -Last 80
-          exit 0
-
-      # Default features first, so a Windows failure can be attributed. The
-      # SRTP rollover test faults here with STATUS_ACCESS_VIOLATION; running it
-      # without audio-proc establishes whether the C++ dependency is involved
-      # at all, rather than assuming it is because it is the newest thing.
-      - name: Run tests, default features (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test -- --test-threads=1
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --all-features -- --test-threads=1 --nocapture
+        run: cargo test --all-features -- --test-threads=1
 
   clippy:
     name: Clippy

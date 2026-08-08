@@ -710,10 +710,10 @@ fn run_audio_tx(
             }
             found.or_else(|| {
                 log::warn!("Input device '{}' not found, using default", name);
-                host.default_input_device()
+                crate::device::safe_default_input_device(&host)
             })
         }
-        None => host.default_input_device(),
+        None => crate::device::safe_default_input_device(&host),
     }
     .ok_or_else(|| Error::device("No input device"))?;
 
@@ -1117,10 +1117,10 @@ fn run_audio_rx(
             }
             found.or_else(|| {
                 log::warn!("Output device '{}' not found, using default", name);
-                host.default_output_device()
+                crate::device::safe_default_output_device(&host)
             })
         }
-        None => host.default_output_device(),
+        None => crate::device::safe_default_output_device(&host),
     }
     .ok_or_else(|| Error::device("No output device"))?;
 

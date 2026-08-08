@@ -11,6 +11,50 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::resample::{f32_to_i16, i16_to_f32, resample_linear};
 
+/// `Host::default_input_device`, but survives a machine with no microphone.
+///
+/// cpal's WASAPI backend does not return `None` when Windows has no capture
+/// endpoint. It faults inside `IMMDeviceEnumerator::GetDefaultAudioEndpoint`
+/// and takes the process with it — confirmed under cdb as
+/// `INVALID_POINTER_READ_c0000005`, reached through
+/// `cpal::host::wasapi::device::default_device`.
+///
+/// Enumeration handles the empty case correctly, so checking whether any device
+/// exists avoids the call entirely on the machine where it would crash.
+/// Elsewhere this costs one extra enumeration and gives the same answer.
+///
+/// Without it, a Windows user with no microphone crashes the application when a
+/// call starts, rather than being told there is no input device.
+pub(crate) fn safe_default_input_device(host: &cpal::Host) -> Option<cpal::Device> {
+    if !has_any(host.input_devices()) {
+        log::warn!("No audio input devices present; not requesting a default one");
+        return None;
+    }
+    host.default_input_device()
+}
+
+/// `Host::default_output_device`, with the same guard as
+/// [`safe_default_input_device`] — the playback endpoint reaches the same cpal
+/// code path and can fault the same way.
+pub(crate) fn safe_default_output_device(host: &cpal::Host) -> Option<cpal::Device> {
+    if !has_any(host.output_devices()) {
+        log::warn!("No audio output devices present; not requesting a default one");
+        return None;
+    }
+    host.default_output_device()
+}
+
+/// Whether an enumeration yielded at least one device.
+///
+/// A failed enumeration counts as none: if the host cannot list its devices,
+/// asking it for a default is not going to go better.
+fn has_any<D>(devices: std::result::Result<D, cpal::DevicesError>) -> bool
+where
+    D: Iterator<Item = cpal::Device>,
+{
+    devices.is_ok_and(|mut d| d.next().is_some())
+}
+
 /// Audio capture device (microphone).
 pub struct AudioCapture {
     _stream: cpal::Stream,
@@ -40,10 +84,10 @@ impl AudioCapture {
                 }
                 found.or_else(|| {
                     log::warn!("Input device '{}' not found, using default", name);
-                    host.default_input_device()
+                    safe_default_input_device(&host)
                 })
             }
-            None => host.default_input_device(),
+            None => safe_default_input_device(&host),
         }
         .ok_or_else(|| Error::device("No input audio device"))?;
 
@@ -55,8 +99,7 @@ impl AudioCapture {
     /// Samples are buffered internally and can be retrieved with `read_samples()`.
     pub fn start() -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
+        let device = safe_default_input_device(&host)
             .ok_or_else(|| Error::device("No input audio device"))?;
 
         Self::start_from_device(device)
@@ -187,10 +230,10 @@ impl AudioPlayback {
                 }
                 found.or_else(|| {
                     log::warn!("Output device '{}' not found, using default", name);
-                    host.default_output_device()
+                    safe_default_output_device(&host)
                 })
             }
-            None => host.default_output_device(),
+            None => safe_default_output_device(&host),
         }
         .ok_or_else(|| Error::device("No output audio device"))?;
 
@@ -202,8 +245,7 @@ impl AudioPlayback {
     /// Samples can be written with `write_samples()`.
     pub fn start() -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
+        let device = safe_default_output_device(&host)
             .ok_or_else(|| Error::device("No output audio device"))?;
 
         Self::start_from_device(device)
@@ -316,8 +358,7 @@ pub struct AudioDevices {
 /// Query available audio input devices (microphones).
 pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
-    let default_name = host
-        .default_input_device()
+    let default_name = safe_default_input_device(&host)
         .and_then(|d| d.description().ok())
         .map(|d| d.name().to_string());
 
@@ -337,8 +378,7 @@ pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
 /// Query available audio output devices (speakers).
 pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
-    let default_name = host
-        .default_output_device()
+    let default_name = safe_default_output_device(&host)
         .and_then(|d| d.description().ok())
         .map(|d| d.name().to_string());
 
