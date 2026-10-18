@@ -168,7 +168,7 @@ mod tests {
         let mut encoded = Vec::new();
         let consumed = encoder.encode(&input, &mut encoded);
         assert_eq!(consumed, 160);
-        assert!(!encoded.is_empty());
+        assert_ne!(encoded, [] as [u8; 0]);
 
         let mut decoded = Vec::new();
         decoder.decode(&encoded, &mut decoded);

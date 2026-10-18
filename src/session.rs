@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 
 use crate::audio_proc::VoiceProcessor;
@@ -49,6 +49,19 @@ pub struct MediaSession {
     rtp_socket: Arc<UdpSocket>,
     ssrc: u32,
     remote_addr: SocketAddr,
+    /// The outbound RTP sequence number and timestamp, shared with the audio
+    /// TX thread. DTMF reads them so its packets continue the same stream
+    /// rather than jumping to a random sequence inside the audio SSRC.
+    tx_seq: Arc<AtomicU16>,
+    tx_ts: Arc<AtomicU32>,
+    /// The TX SRTP context, kept so DTMF can be encrypted. Without it every
+    /// digit went out in the clear on an SDES call and the far end dropped it.
+    #[cfg(feature = "srtp")]
+    tx_srtp: Option<SharedSrtp>,
+    /// The telephone-event payload type to send DTMF on (RFC 4733). 101 is the
+    /// near-universal default; `set_dtmf_payload_type` overrides it with the
+    /// value negotiated from the peer's SDP.
+    dtmf_payload_type: std::sync::atomic::AtomicU8,
     recorder: Arc<std::sync::Mutex<Option<CallRecorder>>>,
     tx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
@@ -313,10 +326,17 @@ impl MediaSession {
                 .parse()
                 .unwrap_or(remote_addr);
 
+        // The outbound sequence and timestamp counters, shared by the audio
+        // TX thread, the keepalive sender and DTMF so they form one stream.
+        let tx_seq = Arc::new(AtomicU16::new(rand::random()));
+        let tx_ts = Arc::new(AtomicU32::new(rand::random()));
+
         // Start TX thread (microphone → RTP)
         #[cfg(feature = "device")]
         {
             let tx_socket = rtp_socket.clone();
+            let tx_seq_ref = tx_seq.clone();
+            let tx_ts_ref = tx_ts.clone();
             let tx_muted = muted.clone();
             let tx_running = running.clone();
             let tx_counters = counters.clone();
@@ -332,6 +352,9 @@ impl MediaSession {
                     tx_socket,
                     remote_addr,
                     ssrc,
+                    codec_type,
+                    tx_seq_ref,
+                    tx_ts_ref,
                     tx_muted,
                     tx_running,
                     encoder,
@@ -364,6 +387,7 @@ impl MediaSession {
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_rx(
                     rx_socket,
+                    codec_type,
                     rx_running,
                     decoder,
                     rx_counters,
@@ -383,7 +407,7 @@ impl MediaSession {
         {
             let rtcp_running = running.clone();
             let rtcp_counters = counters.clone();
-            let rtcp_tx_srtp = tx_srtp;
+            let rtcp_tx_srtp = tx_srtp.clone();
             let rtcp_rx_srtp = rx_srtp;
             tokio::spawn(async move {
                 run_rtcp(
@@ -422,6 +446,11 @@ impl MediaSession {
             tx_level,
             rx_level,
             voice,
+            tx_seq,
+            tx_ts,
+            #[cfg(feature = "srtp")]
+            tx_srtp,
+            dtmf_payload_type: std::sync::atomic::AtomicU8::new(101),
         })
     }
 
@@ -443,7 +472,22 @@ impl MediaSession {
         self.voice.config()
     }
 
-    /// Send an RFC 2833 DTMF digit.
+    /// Set the telephone-event payload type for DTMF, from the peer's SDP.
+    ///
+    /// Defaults to 101. A peer that offers `a=rtpmap:<pt> telephone-event/8000`
+    /// with a different number would otherwise drop every digit, since they
+    /// arrived on a payload type it did not negotiate.
+    pub fn set_dtmf_payload_type(&self, pt: u8) {
+        self.dtmf_payload_type.store(pt, Ordering::Relaxed);
+    }
+
+    /// Send an RFC 4733 DTMF digit as telephone-event packets.
+    ///
+    /// The packets continue the audio stream's own sequence and SSRC and share
+    /// the current audio timestamp as the event's start time, and are
+    /// encrypted with the same SRTP context — so a digit is not dropped for
+    /// jumping the sequence number or for arriving in the clear on an
+    /// encrypted call.
     pub fn send_dtmf(&self, digit: &str) {
         let event_code: u8 = match digit {
             "0" => 0,
@@ -473,39 +517,61 @@ impl MediaSession {
             .and_then(|g| *g)
             .unwrap_or(self.remote_addr);
         let counters = self.counters.clone();
+        let seq = self.tx_seq.clone();
+        // One timestamp for the whole event: it marks when the tone began
+        // (RFC 4733 §2.1). Snapshot the audio stream's current timestamp.
+        let event_ts = self.tx_ts.load(Ordering::Relaxed);
+        let pt = self.dtmf_payload_type.load(Ordering::Relaxed);
+        #[cfg(feature = "srtp")]
+        let srtp = self.tx_srtp.clone();
 
         tokio::spawn(async move {
-            let base_ts: u32 = rand::random();
-            let base_seq: u16 = rand::random();
             let volume: u8 = 10;
-            let pt: u8 = 101;
             let durations = [160u16, 320, 480];
+
+            // Build one telephone-event RTP packet.
+            let build = |marker: bool, is_end: bool, duration: u16| -> Vec<u8> {
+                let current_seq = seq.fetch_add(1, Ordering::Relaxed);
+                telephone_event_packet(
+                    pt,
+                    current_seq,
+                    event_ts,
+                    ssrc,
+                    event_code,
+                    volume,
+                    marker,
+                    is_end,
+                    duration,
+                )
+            };
+
+            // Protect with SRTP when the call is encrypted; send plain otherwise.
+            let send = |packet: Vec<u8>| {
+                #[cfg(feature = "srtp")]
+                let packet = match srtp {
+                    Some(ref ctx) => match ctx.lock() {
+                        Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
+                        Err(_) => packet,
+                    },
+                    None => packet,
+                };
+                let socket = socket.clone();
+                let counters = counters.clone();
+                async move {
+                    let _ = socket.send_to(&packet, dest).await;
+                    counters.record_sent(packet.len() as u64);
+                }
+            };
 
             for (i, &duration) in durations.iter().enumerate() {
                 let is_end = i == durations.len() - 1;
-                let seq = base_seq.wrapping_add(i as u16);
+                send(build(i == 0, is_end, duration)).await;
 
-                let mut packet = Vec::with_capacity(16);
-                packet.push(0x80);
-                let marker = if i == 0 { 0x80 } else { 0x00 };
-                packet.push(pt | marker);
-                packet.extend_from_slice(&seq.to_be_bytes());
-                packet.extend_from_slice(&base_ts.to_be_bytes());
-                packet.extend_from_slice(&ssrc.to_be_bytes());
-
-                let end_flag: u8 = if is_end { 0x80 } else { 0x00 };
-                packet.push(event_code);
-                packet.push(end_flag | (volume & 0x3F));
-                packet.extend_from_slice(&duration.to_be_bytes());
-
-                let _ = socket.send_to(&packet, dest).await;
-                counters.record_sent(packet.len() as u64);
-
+                // The end packet is sent three times total for resilience
+                // against loss, as recommended for the final event report.
                 if is_end {
                     for _ in 0..2 {
-                        let repeat_seq = seq.wrapping_add(1);
-                        packet[2..4].copy_from_slice(&repeat_seq.to_be_bytes());
-                        let _ = socket.send_to(&packet, dest).await;
+                        send(build(false, true, duration)).await;
                     }
                 }
 
@@ -677,10 +743,39 @@ impl std::fmt::Debug for MediaSession {
 // --- Audio TX/RX implementation ---
 
 #[cfg(feature = "device")]
+/// One RFC 4733 telephone-event RTP packet: a 12-byte header followed by the
+/// 4-byte event (event code, end flag + volume, 16-bit duration).
+#[allow(clippy::too_many_arguments)]
+fn telephone_event_packet(
+    pt: u8,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    event_code: u8,
+    volume: u8,
+    marker: bool,
+    is_end: bool,
+    duration: u16,
+) -> Vec<u8> {
+    let mut header = RtpHeader::new(pt, sequence, timestamp, ssrc);
+    if marker {
+        header = header.with_marker();
+    }
+    let mut packet = header.to_bytes();
+    let end_flag: u8 = if is_end { 0x80 } else { 0x00 };
+    packet.push(event_code);
+    packet.push(end_flag | (volume & 0x3F));
+    packet.extend_from_slice(&duration.to_be_bytes());
+    packet
+}
+
 fn run_audio_tx(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
     ssrc: u32,
+    codec_type: CodecType,
+    seq: Arc<AtomicU16>,
+    ts: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     encoder: Box<dyn AudioEncoder>,
@@ -692,8 +787,6 @@ fn run_audio_tx(
     tx_level: Arc<AtomicU32>,
     voice: Arc<VoiceProcessor>,
 ) -> Result<()> {
-    use std::sync::atomic::AtomicU16;
-
     let host = crate::device::host();
     let device = match &input_device_name {
         Some(name) => {
@@ -741,9 +834,12 @@ fn run_audio_tx(
         .map_err(|e| Error::device(format!("Failed to create TX runtime: {}", e)))?;
     let rt_handle = rt.handle().clone();
 
-    let seq = Arc::new(AtomicU16::new(0));
-    let ts = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let pt = encoder.payload_type();
+    // The RTP timestamp advances by the codec's media clock, not the 8 kHz
+    // processing rate. Opus runs a 48 kHz RTP clock (960 ticks per 20 ms
+    // frame); advancing by 160 like G.711 made the far end read every Opus
+    // packet as 3.3 ms of audio and stretch or drop it.
+    let rtp_ts_stride = codec_type.samples_per_frame() as u32;
     let encoder = Arc::new(std::sync::Mutex::new(encoder));
     let sample_buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(1024)));
     let samples_per_frame = 160usize;
@@ -839,7 +935,7 @@ fn run_audio_tx(
                     }
 
                     let current_seq = cb_seq.fetch_add(1, Ordering::Relaxed);
-                    let current_ts = cb_ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
+                    let current_ts = cb_ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
 
                     let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
                     let mut packet = header.to_bytes();
@@ -945,7 +1041,7 @@ fn run_audio_tx(
                 }
 
                 let current_seq = seq.fetch_add(1, Ordering::Relaxed);
-                let current_ts = ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
+                let current_ts = ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
 
                 let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
                 let mut packet = header.to_bytes();
@@ -995,7 +1091,7 @@ fn run_audio_tx(
                 }
 
                 let current_seq = seq.fetch_add(1, Ordering::Relaxed);
-                let current_ts = ts.fetch_add(samples_per_frame as u32, Ordering::Relaxed);
+                let current_ts = ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
 
                 let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
                 let mut packet = header.to_bytes();
@@ -1089,6 +1185,7 @@ fn fill_playback(
 #[cfg(feature = "device")]
 fn run_audio_rx(
     socket: Arc<UdpSocket>,
+    codec_type: CodecType,
     running: Arc<AtomicBool>,
     mut decoder: Box<dyn AudioDecoder>,
     counters: RtpCounters,
@@ -1138,6 +1235,9 @@ fn run_audio_rx(
     };
 
     let codec_rate = 8000u32;
+    // The RTP timestamp clock for jitter timing. The decode pipeline runs at
+    // codec_rate (8 kHz); the RTP timestamps are on the codec's own clock.
+    let rtp_clock = codec_type.clock_rate();
 
     // Pre-buffer: accumulate 60ms of audio before starting playback to absorb jitter
     let pre_buffer_samples = (native_rate as usize * 60) / 1000; // 60ms at native rate
@@ -1196,7 +1296,10 @@ fn run_audio_rx(
                 min_ms: 20,
                 max_ms: 150,
             },
-            clock_rate: codec_rate,
+            // The RTP media clock, which for Opus is 48 kHz — not the 8 kHz
+            // the decode pipeline processes at. With the processing rate here
+            // the jitter buffer mis-timed every Opus packet by 6x.
+            clock_rate: rtp_clock,
             max_packets: 50,
         };
         let mut jitter_buf = JitterBuffer::new(jitter_config);
@@ -1270,7 +1373,10 @@ fn run_audio_rx(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_micros() as i64;
-                                let transit = arrival - (ts as i64 * 125);
+                                // Microseconds per RTP tick: 125 at 8 kHz,
+                                // but ~20.8 at Opus's 48 kHz clock.
+                                let usec_per_tick = 1_000_000 / i64::from(rtp_clock);
+                                let transit = arrival - (ts as i64 * usec_per_tick);
                                 if let Some(prev) = last_transit {
                                     let d = (transit - prev).unsigned_abs();
                                     counters.update_jitter(d);
@@ -1454,6 +1560,73 @@ mod tests {
         assert_eq!(CodecType::Pcmu.samples_per_frame(), 160);
     }
 
+    /// Opus runs a 48 kHz RTP clock: its timestamp advances 960 ticks per
+    /// 20 ms frame, not the 160 of an 8 kHz codec. The TX path and the RX
+    /// jitter buffer both read these.
+    #[cfg(feature = "opus")]
+    #[test]
+    fn opus_uses_a_48khz_rtp_clock() {
+        assert_eq!(CodecType::Opus.clock_rate(), 48000);
+        assert_eq!(CodecType::Opus.samples_per_frame(), 960);
+    }
+
+    /// A telephone-event packet is a 12-byte RTP header plus the 4-byte event.
+    /// The marker bit flags the first packet of the tone; the end flag the
+    /// last; and the sequence continues the stream it is handed.
+    #[test]
+    fn telephone_event_packet_has_the_rfc4733_shape() {
+        // event 5, seq 100, ts 0x11223344, ssrc 0xDEADBEEF, first packet.
+        let pkt = telephone_event_packet(101, 100, 0x11223344, 0xDEADBEEF, 5, 10, true, false, 160);
+        assert_eq!(pkt.len(), 16);
+        // Marker bit set, payload type 101.
+        assert_eq!(pkt[1], 0x80 | 0x65); // marker | PT 101
+        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 100);
+        assert_eq!(
+            u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]),
+            0x11223344
+        );
+        assert_eq!(
+            u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]),
+            0xDEADBEEF
+        );
+        assert_eq!(pkt[12], 5); // event code
+        assert_eq!(pkt[13], 10); // not end, volume 10
+        assert_eq!(u16::from_be_bytes([pkt[14], pkt[15]]), 160);
+
+        // The end packet sets the top bit of byte 13 and clears the marker.
+        let end = telephone_event_packet(101, 101, 0x11223344, 0xDEADBEEF, 5, 10, false, true, 480);
+        assert_eq!(end[1], 101); // no marker
+        assert_eq!(end[13] & 0x80, 0x80); // end flag
+        assert_eq!(u16::from_be_bytes([end[2], end[3]]), 101); // sequence continued
+    }
+
+    /// The same timestamp marks every packet of one event (its start time),
+    /// while the sequence number advances — the property a receiver uses to
+    /// group the event's packets.
+    #[test]
+    fn telephone_event_packets_share_a_timestamp_and_advance_the_sequence() {
+        let ts = 0x0000_2000;
+        let a = telephone_event_packet(101, 7, ts, 1, 3, 10, true, false, 160);
+        let b = telephone_event_packet(101, 8, ts, 1, 3, 10, false, false, 320);
+        assert_eq!(&a[4..8], &b[4..8], "same event timestamp");
+        assert_ne!(&a[2..4], &b[2..4], "sequence advances");
+    }
+
+    /// A telephone-event packet survives SRTP protect/unprotect: on an
+    /// encrypted call DTMF must go through the TX context, not the socket
+    /// raw, or the far end's auth check drops every digit.
+    #[cfg(feature = "srtp")]
+    #[test]
+    fn telephone_event_packet_round_trips_through_srtp() {
+        let (mut tx, key) = crate::srtp::SrtpContext::generate().expect("generate");
+        let mut rx = crate::srtp::SrtpContext::from_base64(&key).expect("rx ctx");
+        let plain = telephone_event_packet(101, 42, 0x55, 0x99, 1, 10, true, false, 160);
+        let protected = tx.protect_rtp(&plain).expect("protect");
+        assert!(protected.len() > plain.len(), "SRTP adds an auth tag");
+        let recovered = rx.unprotect_rtp(&protected).expect("unprotect");
+        assert_eq!(recovered, plain);
+    }
+
     #[tokio::test]
     async fn test_media_session_start_invalid_port() {
         // Try to bind to a privileged port (requires root)
@@ -1542,7 +1715,7 @@ mod tests {
         use crate::srtp::SrtpContext;
 
         let (_ctx, key) = SrtpContext::generate().unwrap();
-        assert!(!key.is_empty());
+        assert_ne!(key, "");
 
         // Context should be able to protect/unprotect
         let mut test_rtp = vec![

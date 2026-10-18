@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(bytes.len(), 12);
 
         let parsed = RtpPacket::parse(&bytes).unwrap();
-        assert!(parsed.payload.is_empty());
+        assert_eq!(parsed.payload, [] as [u8; 0]);
     }
 
     #[test]

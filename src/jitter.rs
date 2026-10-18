@@ -521,7 +521,7 @@ mod tests {
         let p2 = jitter.pop().unwrap();
         assert_eq!(p2.seq, 1);
         assert!(p2.synthesized);
-        assert!(p2.payload.is_empty());
+        assert_eq!(p2.payload, [] as [u8; 0]);
 
         // Third packet normal
         let p3 = jitter.pop().unwrap();

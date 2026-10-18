@@ -315,7 +315,7 @@ mod tests {
         let input: Vec<f32> = vec![];
         let output = resample_linear(&input, 8000, 48000);
 
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [f32; 0]);
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         let input: Vec<f32> = vec![0.5; 32];
         let output = resample_linear(&input, 8000, 48000);
 
-        assert!(!output.is_empty());
+        assert_ne!(output, [] as [f32; 0]);
     }
 
     #[test]

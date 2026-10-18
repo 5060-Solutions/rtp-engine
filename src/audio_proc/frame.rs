@@ -244,7 +244,7 @@ mod tests {
     fn an_empty_push_is_harmless() {
         let mut acc = FrameAccumulator::new(48_000).expect("supported rate");
         let out = frames_for(&mut acc, &[]);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [f32; 0]);
         assert_eq!(acc.pending_len(), 0);
     }
 

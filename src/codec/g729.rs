@@ -398,7 +398,7 @@ impl G729Decoder {
         for i in 1..=LPC_ORDER {
             let p_idx = i.min(LPC_ORDER / 2);
             let q_idx = i.min(LPC_ORDER / 2);
-            a[i] = 0.5 * (p[p_idx] + q[q_idx]);
+            a[i] = f32::midpoint(p[p_idx], q[q_idx]);
         }
 
         a

@@ -342,7 +342,7 @@ mod tests {
         let mut output = Vec::new();
         let consumed = encoder.encode(&[], &mut output);
         assert_eq!(consumed, 0);
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
     }
 
     #[test]
@@ -350,7 +350,7 @@ mod tests {
         let mut decoder = create_decoder(CodecType::Pcmu).unwrap();
         let mut output = Vec::new();
         decoder.decode(&[], &mut output);
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [i16; 0]);
     }
 
     #[test]
