@@ -62,6 +62,15 @@ pub struct MediaSession {
     /// near-universal default; `set_dtmf_payload_type` overrides it with the
     /// value negotiated from the peer's SDP.
     dtmf_payload_type: std::sync::atomic::AtomicU8,
+    /// The clock rate of the negotiated telephone-event payload (RFC 4733).
+    /// Event durations and timestamps are in these units. 8000 is the
+    /// classic value; a peer that pairs Opus with `telephone-event/48000`
+    /// expects durations six times larger.
+    dtmf_clock_rate: AtomicU32,
+    /// The payload type outgoing audio is sent on. Starts as the codec's
+    /// conventional number and is overridden by `set_audio_payload_type`
+    /// when the peer carries a dynamic codec on a different one.
+    tx_payload_type: Arc<std::sync::atomic::AtomicU8>,
     recorder: Arc<std::sync::Mutex<Option<CallRecorder>>>,
     tx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
     rx_recorder_handle: Arc<std::sync::Mutex<Option<RecorderHandle>>>,
@@ -330,6 +339,7 @@ impl MediaSession {
         // TX thread, the keepalive sender and DTMF so they form one stream.
         let tx_seq = Arc::new(AtomicU16::new(rand::random()));
         let tx_ts = Arc::new(AtomicU32::new(rand::random()));
+        let tx_payload_type = Arc::new(std::sync::atomic::AtomicU8::new(codec_type.payload_type()));
 
         // Start TX thread (microphone → RTP)
         #[cfg(feature = "device")]
@@ -337,6 +347,7 @@ impl MediaSession {
             let tx_socket = rtp_socket.clone();
             let tx_seq_ref = tx_seq.clone();
             let tx_ts_ref = tx_ts.clone();
+            let tx_pt_ref = tx_payload_type.clone();
             let tx_muted = muted.clone();
             let tx_running = running.clone();
             let tx_counters = counters.clone();
@@ -355,6 +366,7 @@ impl MediaSession {
                     codec_type,
                     tx_seq_ref,
                     tx_ts_ref,
+                    tx_pt_ref,
                     tx_muted,
                     tx_running,
                     encoder,
@@ -384,10 +396,12 @@ impl MediaSession {
             let rx_output_device = output_device_name;
             let rx_level_ref = rx_level.clone();
             let rx_voice = voice.clone();
+            let rx_pt_ref = tx_payload_type.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_rx(
                     rx_socket,
                     codec_type,
+                    rx_pt_ref,
                     rx_running,
                     decoder,
                     rx_counters,
@@ -409,11 +423,14 @@ impl MediaSession {
             let rtcp_counters = counters.clone();
             let rtcp_tx_srtp = tx_srtp.clone();
             let rtcp_rx_srtp = rx_srtp;
+            let rtcp_tx_ts = tx_ts.clone();
             tokio::spawn(async move {
                 run_rtcp(
                     rtcp_socket,
                     remote_rtcp_addr,
                     ssrc,
+                    codec_type.clock_rate(),
+                    rtcp_tx_ts,
                     rtcp_running,
                     rtcp_counters,
                     rtcp_tx_srtp,
@@ -451,6 +468,8 @@ impl MediaSession {
             #[cfg(feature = "srtp")]
             tx_srtp,
             dtmf_payload_type: std::sync::atomic::AtomicU8::new(101),
+            dtmf_clock_rate: AtomicU32::new(8000),
+            tx_payload_type,
         })
     }
 
@@ -479,6 +498,32 @@ impl MediaSession {
     /// arrived on a payload type it did not negotiate.
     pub fn set_dtmf_payload_type(&self, pt: u8) {
         self.dtmf_payload_type.store(pt, Ordering::Relaxed);
+    }
+
+    /// Set the clock rate of the negotiated telephone-event payload.
+    ///
+    /// Defaults to 8000, the rate of `telephone-event/8000`. RFC 4733 §2.1
+    /// measures an event's duration and timestamp in the event payload's own
+    /// clock, so when the peer negotiated `telephone-event/48000` to go with
+    /// Opus, each 20 ms packet must report 960 units, not 160 — otherwise the
+    /// far end hears a 3 ms blip and ignores the digit. A rate of 0 is
+    /// ignored.
+    pub fn set_dtmf_clock_rate(&self, clock_rate: u32) {
+        if clock_rate == 0 {
+            log::warn!("Ignoring a telephone-event clock rate of 0");
+            return;
+        }
+        self.dtmf_clock_rate.store(clock_rate, Ordering::Relaxed);
+    }
+
+    /// Set the payload type outgoing audio is sent on, from the peer's SDP.
+    ///
+    /// Defaults to the codec's conventional number (0, 8, 18, 111). A peer
+    /// that carries Opus on another dynamic payload type — say 96 — would
+    /// otherwise receive every packet marked 111 and drop it. See
+    /// [`crate::codec::negotiate_codec_with_pt`].
+    pub fn set_audio_payload_type(&self, pt: u8) {
+        self.tx_payload_type.store(pt, Ordering::Relaxed);
     }
 
     /// Send an RFC 4733 DTMF digit as telephone-event packets.
@@ -519,15 +564,22 @@ impl MediaSession {
         let counters = self.counters.clone();
         let seq = self.tx_seq.clone();
         // One timestamp for the whole event: it marks when the tone began
-        // (RFC 4733 §2.1). Snapshot the audio stream's current timestamp.
-        let event_ts = self.tx_ts.load(Ordering::Relaxed);
+        // (RFC 4733 §2.1). Snapshot the audio stream's current timestamp and
+        // put it on the event payload's clock, which is where the event's
+        // timestamp and duration are measured.
+        let event_rate = self.dtmf_clock_rate.load(Ordering::Relaxed);
+        let event_ts = dtmf_event_timestamp(
+            self.tx_ts.load(Ordering::Relaxed),
+            self.codec.clock_rate(),
+            event_rate,
+        );
+        let durations = dtmf_durations(event_rate);
         let pt = self.dtmf_payload_type.load(Ordering::Relaxed);
         #[cfg(feature = "srtp")]
         let srtp = self.tx_srtp.clone();
 
         tokio::spawn(async move {
             let volume: u8 = 10;
-            let durations = [160u16, 320, 480];
 
             // Build one telephone-event RTP packet.
             let build = |marker: bool, is_end: bool, duration: u16| -> Vec<u8> {
@@ -644,7 +696,10 @@ impl MediaSession {
     /// # Arguments
     /// * `output_path` - Path for the output WAV file
     pub fn start_recording(&self, output_path: std::path::PathBuf) -> Result<()> {
-        let recorder = CallRecorder::new(output_path, 8000); // VoIP sample rate
+        // The audio threads hand the recorder PCM at the codec's own rate, so
+        // the WAV header says that rate: 8 kHz for G.711/G.729, 48 kHz for
+        // Opus. The hardcoded 8000 made an Opus recording play six times slow.
+        let recorder = CallRecorder::new(output_path, self.codec.pcm_rate());
 
         // Get handles for TX and RX
         let tx_handle = recorder.tx_handle();
@@ -742,6 +797,27 @@ impl std::fmt::Debug for MediaSession {
 
 // --- Audio TX/RX implementation ---
 
+/// The durations reported by the three packets of one DTMF digit, in
+/// telephone-event clock units (RFC 4733 §2.5.1.2): 20, 40 and 60 ms of
+/// tone, which at 8 kHz is 160/320/480 and at 48 kHz 960/1920/2880.
+fn dtmf_durations(event_clock_rate: u32) -> [u16; 3] {
+    let per_packet = u64::from(event_clock_rate) * u64::from(CodecType::PACKET_DURATION_MS) / 1000;
+    let scaled = |n: u64| (per_packet * n).min(u64::from(u16::MAX)) as u16;
+    [scaled(1), scaled(2), scaled(3)]
+}
+
+/// The audio stream's current timestamp expressed on the telephone-event
+/// clock, which is the clock an event's timestamp is measured in (RFC 4733
+/// §2.1). When the two clocks match — the usual case — this is the identity;
+/// RFC 7160 §4.1 has the timestamp converted by the ratio of the rates when
+/// they do not.
+fn dtmf_event_timestamp(audio_ts: u32, audio_clock_rate: u32, event_clock_rate: u32) -> u32 {
+    if audio_clock_rate == event_clock_rate || audio_clock_rate == 0 {
+        return audio_ts;
+    }
+    (u64::from(audio_ts) * u64::from(event_clock_rate) / u64::from(audio_clock_rate)) as u32
+}
+
 #[cfg(feature = "device")]
 /// One RFC 4733 telephone-event RTP packet: a 12-byte header followed by the
 /// 4-byte event (event code, end flag + volume, 16-bit duration).
@@ -776,6 +852,7 @@ fn run_audio_tx(
     codec_type: CodecType,
     seq: Arc<AtomicU16>,
     ts: Arc<AtomicU32>,
+    payload_type: Arc<std::sync::atomic::AtomicU8>,
     muted: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     encoder: Box<dyn AudioEncoder>,
@@ -823,8 +900,18 @@ fn run_audio_tx(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let codec_rate = 8000u32;
+    // The encoder runs at the codec's own PCM rate: 8 kHz for G.711 and
+    // G.729, 48 kHz for Opus. Everything between the microphone and the
+    // encoder is resampled from the device rate to this one.
+    let codec_rate = codec_type.pcm_rate();
     let resample_ratio = codec_rate as f64 / native_rate as f64;
+    log::info!(
+        "Audio TX: {} at {} Hz PCM, {} samples per packet, RTP clock {} Hz",
+        codec_type,
+        codec_rate,
+        codec_type.pcm_samples_per_packet(),
+        codec_type.clock_rate()
+    );
 
     // Create a multi-threaded runtime for async UDP sends from audio callback
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -834,15 +921,14 @@ fn run_audio_tx(
         .map_err(|e| Error::device(format!("Failed to create TX runtime: {}", e)))?;
     let rt_handle = rt.handle().clone();
 
-    let pt = encoder.payload_type();
-    // The RTP timestamp advances by the codec's media clock, not the 8 kHz
-    // processing rate. Opus runs a 48 kHz RTP clock (960 ticks per 20 ms
-    // frame); advancing by 160 like G.711 made the far end read every Opus
-    // packet as 3.3 ms of audio and stretch or drop it.
-    let rtp_ts_stride = codec_type.samples_per_frame() as u32;
+    // The RTP timestamp advances by one packet's worth of the codec's media
+    // clock: 160 for the 8 kHz codecs, 960 for Opus. This is per *packet*,
+    // not per codec frame — G.729's frame is 10 ms, and striding by that
+    // while sending 20 ms packets ran its timestamp at half speed.
+    let rtp_ts_stride = codec_type.rtp_ticks_per_packet();
     let encoder = Arc::new(std::sync::Mutex::new(encoder));
     let sample_buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(1024)));
-    let samples_per_frame = 160usize;
+    let samples_per_frame = codec_type.pcm_samples_per_packet();
     let native_samples_per_frame = ((samples_per_frame as f64) / resample_ratio).ceil() as usize;
 
     // Persistent TX resampler: native rate → codec rate (e.g. 48kHz → 8kHz)
@@ -852,7 +938,16 @@ fn run_audio_tx(
         native_samples_per_frame,
     )));
 
-    // Silence PCM buffer for muted/keepalive packets (160 samples of silence)
+    // Resampled PCM waiting to be encoded. The resampler's output length can
+    // differ from the packet size by a sample either way, and both libopus
+    // and G.729 want exactly one packet's worth per call: libopus refuses
+    // any other length and G.729 drops the remainder. This buffer absorbs
+    // the drift so every encode sees exactly `samples_per_frame` samples.
+    let pending_pcm: Arc<std::sync::Mutex<Vec<i16>>> = Arc::new(std::sync::Mutex::new(
+        Vec::with_capacity(samples_per_frame * 2),
+    ));
+
+    // Silence PCM buffer for muted/keepalive packets (one packet of silence)
     let silence_pcm: Vec<i16> = vec![0i16; samples_per_frame];
 
     let cb_running = running.clone();
@@ -866,6 +961,8 @@ fn run_audio_tx(
     let cb_rt = rt_handle.clone();
     let cb_recorder = recorder_handle.clone();
     let cb_resampler = tx_resampler.clone();
+    let cb_pending = pending_pcm.clone();
+    let cb_pt = payload_type.clone();
     #[cfg(feature = "srtp")]
     let cb_srtp = _srtp.clone();
 
@@ -925,72 +1022,82 @@ fn run_audio_tx(
                         Ok(mut r) => r.process(&chunk),
                         Err(_) => resample_linear(&chunk, native_rate, codec_rate),
                     };
-                    let pcm = f32_to_i16(&resampled);
-
-                    // Record TX audio if recording is active
-                    if let Ok(handle) = cb_recorder.lock() {
-                        if let Some(ref rec) = *handle {
-                            rec.add_samples(&pcm);
-                        }
-                    }
-
-                    let current_seq = cb_seq.fetch_add(1, Ordering::Relaxed);
-                    let current_ts = cb_ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
-
-                    let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
-                    let mut packet = header.to_bytes();
-
-                    if let Ok(mut enc) = cb_encoder.lock() {
-                        enc.encode(&pcm, &mut packet);
-                    }
-
-                    #[cfg(feature = "srtp")]
-                    let send_packet = if let Some(ref srtp_ctx) = cb_srtp {
-                        match srtp_ctx.lock() {
-                            Ok(mut ctx) => match ctx.protect_rtp(&packet) {
-                                Ok(encrypted) => {
-                                    // Log first SRTP protect
-                                    static PROTECT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                                    if !PROTECT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                        log::info!("SRTP TX: first packet protected (plain len={}, encrypted len={})", packet.len(), encrypted.len());
-                                    }
-                                    encrypted
-                                }
-                                Err(e) => {
-                                    log::error!("SRTP protect failed: {}", e);
-                                    continue;
-                                }
-                            },
-                            Err(_) => packet,
-                        }
-                    } else {
-                        log::debug!("TX: No SRTP context, sending plain RTP");
-                        packet
+                    let mut pending = match cb_pending.lock() {
+                        Ok(p) => p,
+                        Err(_) => continue,
                     };
+                    pending.extend(f32_to_i16(&resampled));
 
-                    #[cfg(not(feature = "srtp"))]
-                    let send_packet = packet;
+                    // Send exactly one packet's worth of samples per encode.
+                    while pending.len() >= samples_per_frame {
+                        let pcm: Vec<i16> = pending.drain(..samples_per_frame).collect();
 
-                    cb_counters.record_sent(send_packet.len() as u64);
+                        // Record TX audio if recording is active
+                        if let Ok(handle) = cb_recorder.lock() {
+                            if let Some(ref rec) = *handle {
+                                rec.add_samples(&pcm);
+                            }
+                        }
 
-                    // Log first audio packet and then periodically (every 50 packets = ~1 second)
-                    let count = cb_mic_count.fetch_add(1, Ordering::Relaxed);
-                    if !cb_first_logged.swap(true, Ordering::Relaxed) {
-                        log::info!("Audio TX: first mic packet captured, rms={:.4}", rms);
-                    } else if count % 50 == 0 {
-                        log::debug!(
-                            "Audio TX: sent {} mic packets, seq={}, rms={:.4}",
-                            count + 1,
-                            current_seq,
-                            rms
-                        );
+                        let current_seq = cb_seq.fetch_add(1, Ordering::Relaxed);
+                        let current_ts = cb_ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
+                        let pt = cb_pt.load(Ordering::Relaxed);
+
+                        let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
+                        let mut packet = header.to_bytes();
+
+                        if let Ok(mut enc) = cb_encoder.lock() {
+                            enc.encode(&pcm, &mut packet);
+                        }
+
+                        #[cfg(feature = "srtp")]
+                        let send_packet = if let Some(ref srtp_ctx) = cb_srtp {
+                            match srtp_ctx.lock() {
+                                Ok(mut ctx) => match ctx.protect_rtp(&packet) {
+                                    Ok(encrypted) => {
+                                        // Log first SRTP protect
+                                        static PROTECT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                        if !PROTECT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                            log::info!("SRTP TX: first packet protected (plain len={}, encrypted len={})", packet.len(), encrypted.len());
+                                        }
+                                        encrypted
+                                    }
+                                    Err(e) => {
+                                        log::error!("SRTP protect failed: {}", e);
+                                        continue;
+                                    }
+                                },
+                                Err(_) => packet,
+                            }
+                        } else {
+                            log::debug!("TX: No SRTP context, sending plain RTP");
+                            packet
+                        };
+
+                        #[cfg(not(feature = "srtp"))]
+                        let send_packet = packet;
+
+                        cb_counters.record_sent(send_packet.len() as u64);
+
+                        // Log first audio packet and then periodically (every 50 packets = ~1 second)
+                        let count = cb_mic_count.fetch_add(1, Ordering::Relaxed);
+                        if !cb_first_logged.swap(true, Ordering::Relaxed) {
+                            log::info!("Audio TX: first mic packet captured, rms={:.4}", rms);
+                        } else if count % 50 == 0 {
+                            log::debug!(
+                                "Audio TX: sent {} mic packets, seq={}, rms={:.4}",
+                                count + 1,
+                                current_seq,
+                                rms
+                            );
+                        }
+
+                        let dest = cb_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
+                        let socket = cb_socket.clone();
+                        cb_rt.spawn(async move {
+                            let _ = socket.send_to(&send_packet, dest).await;
+                        });
                     }
-
-                    let dest = cb_learned.lock().ok().and_then(|g| *g).unwrap_or(remote);
-                    let socket = cb_socket.clone();
-                    cb_rt.spawn(async move {
-                        let _ = socket.send_to(&send_packet, dest).await;
-                    });
                 }
             },
             |err| log::error!("Audio input error: {}", err),
@@ -1042,6 +1149,7 @@ fn run_audio_tx(
 
                 let current_seq = seq.fetch_add(1, Ordering::Relaxed);
                 let current_ts = ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
+                let pt = payload_type.load(Ordering::Relaxed);
 
                 let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
                 let mut packet = header.to_bytes();
@@ -1092,6 +1200,7 @@ fn run_audio_tx(
 
                 let current_seq = seq.fetch_add(1, Ordering::Relaxed);
                 let current_ts = ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
+                let pt = payload_type.load(Ordering::Relaxed);
 
                 let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
                 let mut packet = header.to_bytes();
@@ -1186,6 +1295,7 @@ fn fill_playback(
 fn run_audio_rx(
     socket: Arc<UdpSocket>,
     codec_type: CodecType,
+    payload_type: Arc<std::sync::atomic::AtomicU8>,
     running: Arc<AtomicBool>,
     mut decoder: Box<dyn AudioDecoder>,
     counters: RtpCounters,
@@ -1234,10 +1344,20 @@ fn run_audio_rx(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let codec_rate = 8000u32;
-    // The RTP timestamp clock for jitter timing. The decode pipeline runs at
-    // codec_rate (8 kHz); the RTP timestamps are on the codec's own clock.
+    // The decoder produces PCM at the codec's own rate (8 kHz for G.711 and
+    // G.729, 48 kHz for Opus); it is resampled from there to the device.
+    let codec_rate = codec_type.pcm_rate();
+    let samples_per_packet = codec_type.pcm_samples_per_packet();
+    // The RTP timestamp clock for jitter timing, which is a separate thing
+    // from the PCM rate even though they agree for these codecs.
     let rtp_clock = codec_type.clock_rate();
+    log::info!(
+        "Audio RX: {} at {} Hz PCM, {} samples per packet, RTP clock {} Hz",
+        codec_type,
+        codec_rate,
+        samples_per_packet,
+        rtp_clock
+    );
 
     // Pre-buffer: accumulate 60ms of audio before starting playback to absorb jitter
     let pre_buffer_samples = (native_rate as usize * 60) / 1000; // 60ms at native rate
@@ -1288,6 +1408,9 @@ fn run_audio_rx(
         let mut buf = [0u8; 2048];
         let mut last_transit: Option<i64> = None;
         let mut first_seq: Option<u16> = None;
+        // Payload types other than the audio one that have shown up, so each
+        // is logged once rather than per packet.
+        let mut other_pts_seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
         // Jitter buffer: 40ms target delay, adapts between 20-150ms
         let jitter_config = JitterConfig {
@@ -1308,9 +1431,11 @@ fn run_audio_rx(
         let mut playout_interval = tokio::time::interval(std::time::Duration::from_millis(20));
         playout_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Persistent resampler: maintains state across frames for glitch-free audio
-        // 160 samples = 20ms at 8kHz codec rate
-        let mut rx_resampler = StreamResampler::new(codec_rate, native_rate, 160);
+        // Persistent resampler: maintains state across frames for glitch-free
+        // audio. Chunked at one packet of PCM at the codec rate (160 at
+        // 8 kHz, 960 for Opus); a pass-through when the device already runs
+        // at the codec rate.
+        let mut rx_resampler = StreamResampler::new(codec_rate, native_rate, samples_per_packet);
 
         loop {
             if !running.load(Ordering::Relaxed) {
@@ -1386,6 +1511,25 @@ fn run_audio_rx(
 
                             // Push into jitter buffer instead of decoding immediately
                             if let Some((header, payload)) = parse_rtp(&rtp_data) {
+                                // Only the negotiated audio payload type goes
+                                // to the decoder. A peer's telephone-event
+                                // (DTMF) and comfort-noise packets share the
+                                // stream; handed to libopus they are "invalid
+                                // packet" errors, and to G.711 a burst of
+                                // noise. The jitter buffer treats the skipped
+                                // sequence numbers as loss and conceals them.
+                                let expected_pt = payload_type.load(Ordering::Relaxed);
+                                if header.payload_type != expected_pt {
+                                    if other_pts_seen.insert(header.payload_type) {
+                                        log::info!(
+                                            "Audio RX: ignoring RTP payload type {} ({} bytes); audio is on {}",
+                                            header.payload_type,
+                                            payload.len(),
+                                            expected_pt
+                                        );
+                                    }
+                                    continue;
+                                }
                                 let s = header.sequence;
                                 let t = header.timestamp;
                                 jitter_buf.push(s, t, payload.to_vec());
@@ -1401,10 +1545,14 @@ fn run_audio_rx(
                 _ = playout_interval.tick() => {
                     if let Some(pkt) = jitter_buf.pop() {
                         // Decode the payload (empty payload = loss concealment)
-                        let mut pcm = Vec::with_capacity(160);
+                        let mut pcm = Vec::with_capacity(samples_per_packet);
                         if pkt.payload.is_empty() {
-                            // Packet loss concealment: repeat last frame as silence
-                            pcm.resize(160, 0i16);
+                            // Packet loss. The codec conceals it: Opus
+                            // rebuilds the frame from the FEC copy in the
+                            // next packet when that has already arrived,
+                            // or extrapolates; the plain codecs fill silence.
+                            let next = jitter_buf.peek_next().map(|p| p.payload.as_slice());
+                            decoder.conceal_loss(samples_per_packet, next, &mut pcm);
                         } else {
                             decoder.decode(&pkt.payload, &mut pcm);
                         }
@@ -1444,10 +1592,19 @@ fn run_audio_rx(
     Ok(())
 }
 
+/// Interarrival jitter for an RTCP receiver report: the microsecond estimate
+/// in RTP timestamp units (RFC 3550 §6.4.1), which is 125 µs per tick at
+/// 8 kHz but ~20.8 µs at Opus's 48 kHz clock.
+fn rtcp_jitter_ticks(jitter_us: u64, clock_rate: u32) -> u32 {
+    (jitter_us * u64::from(clock_rate) / 1_000_000) as u32
+}
+
 async fn run_rtcp(
     socket: Arc<UdpSocket>,
     remote_addr: SocketAddr,
     ssrc: u32,
+    clock_rate: u32,
+    tx_ts: Arc<AtomicU32>,
     running: Arc<AtomicBool>,
     counters: RtpCounters,
     _tx_srtp: Option<SharedSrtp>,
@@ -1462,9 +1619,16 @@ async fn run_rtcp(
             break;
         }
 
-        // Send Sender Report
+        // Send Sender Report. The RTP timestamp is the stream's own counter
+        // — the value the next audio packet will carry — so the receiver can
+        // line the NTP time up with it on the codec's clock.
         let stats = counters.snapshot();
-        let sr = build_rtcp_sr(ssrc, stats.packets_sent as u32, stats.bytes_sent as u32);
+        let sr = build_rtcp_sr(
+            ssrc,
+            stats.packets_sent as u32,
+            stats.bytes_sent as u32,
+            tx_ts.load(Ordering::Relaxed),
+        );
 
         #[cfg(feature = "srtp")]
         let sr_to_send = if let Some(ref srtp_ctx) = _tx_srtp {
@@ -1497,7 +1661,7 @@ async fn run_rtcp(
                 loss_fraction,
                 lost as u32,
                 counters.highest_seq.load(Ordering::Relaxed),
-                (counters.jitter_us.load(Ordering::Relaxed) / 125) as u32,
+                rtcp_jitter_ticks(counters.jitter_us.load(Ordering::Relaxed), clock_rate),
             );
 
             #[cfg(feature = "srtp")]
@@ -1568,6 +1732,43 @@ mod tests {
     fn opus_uses_a_48khz_rtp_clock() {
         assert_eq!(CodecType::Opus.clock_rate(), 48000);
         assert_eq!(CodecType::Opus.samples_per_frame(), 960);
+    }
+
+    /// DTMF durations are 20/40/60 ms in the event payload's clock units:
+    /// 160/320/480 at the classic 8 kHz, six times that when the peer paired
+    /// Opus with `telephone-event/48000`.
+    #[test]
+    fn dtmf_durations_scale_with_the_event_clock() {
+        assert_eq!(dtmf_durations(8000), [160, 320, 480]);
+        assert_eq!(dtmf_durations(48000), [960, 1920, 2880]);
+        assert_eq!(dtmf_durations(16000), [320, 640, 960]);
+    }
+
+    /// The event timestamp is the audio timestamp when the clocks match, and
+    /// is converted by the ratio of the rates when they do not.
+    #[test]
+    fn dtmf_event_timestamp_is_on_the_event_clock() {
+        assert_eq!(dtmf_event_timestamp(12_345, 8000, 8000), 12_345);
+        assert_eq!(dtmf_event_timestamp(12_345, 48000, 48000), 12_345);
+        // Opus audio at 48 kHz, telephone-event negotiated at 8 kHz.
+        assert_eq!(dtmf_event_timestamp(96_000, 48000, 8000), 16_000);
+        // G.711 audio at 8 kHz, telephone-event at 48 kHz.
+        assert_eq!(dtmf_event_timestamp(16_000, 8000, 48000), 96_000);
+        // No overflow near the top of the u32 range.
+        assert_eq!(
+            dtmf_event_timestamp(u32::MAX, 8000, 48000),
+            (u64::from(u32::MAX) * 6) as u32
+        );
+    }
+
+    /// RTCP jitter is reported in RTP timestamp units of the codec's clock.
+    #[test]
+    fn rtcp_jitter_is_scaled_by_the_codec_clock() {
+        // 1 ms of jitter: 8 ticks at 8 kHz, 48 at 48 kHz.
+        assert_eq!(rtcp_jitter_ticks(1000, 8000), 8);
+        assert_eq!(rtcp_jitter_ticks(1000, 48000), 48);
+        assert_eq!(rtcp_jitter_ticks(125, 8000), 1);
+        assert_eq!(rtcp_jitter_ticks(0, 48000), 0);
     }
 
     /// A telephone-event packet is a 12-byte RTP header plus the 4-byte event.

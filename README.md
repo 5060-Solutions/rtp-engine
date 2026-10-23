@@ -239,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `g711` | ✓ | G.711 μ-law (PCMU) and A-law (PCMA) codecs |
-| `opus` | ✓ | Opus codec with automatic resampling (requires libopus) |
+| `opus` | ✓ | Opus codec at native 48 kHz with in-band FEC (requires libopus) |
 | `srtp` | ✓ | SRTP/SRTCP encryption (AES-CM-128-HMAC-SHA1-80) |
 | `device` | ✓ | Audio device capture and playback via cpal |
 | `audio-proc` | | Acoustic echo cancellation and noise suppression (see below) |
@@ -331,9 +331,9 @@ sequenceDiagram
     participant Spk as 🔊 Speaker
 
     Note over Mic,Spk: Outbound Audio
-    Mic->>Enc: PCM samples (48kHz)
-    Enc->>Enc: Resample to 8kHz
-    Enc->>SRTP: G.711 payload
+    Mic->>Enc: PCM samples (device rate)
+    Enc->>Enc: Resample to the codec's rate (8kHz G.711/G.729, 48kHz Opus)
+    Enc->>SRTP: Codec payload
     SRTP->>Net: Encrypted RTP
 
     Note over Mic,Spk: Inbound Audio  
