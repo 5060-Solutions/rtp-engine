@@ -396,10 +396,12 @@ impl MediaSession {
             let rx_output_device = output_device_name;
             let rx_level_ref = rx_level.clone();
             let rx_voice = voice.clone();
+            let rx_pt_ref = tx_payload_type.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_rx(
                     rx_socket,
                     codec_type,
+                    rx_pt_ref,
                     rx_running,
                     decoder,
                     rx_counters,
@@ -1293,6 +1295,7 @@ fn fill_playback(
 fn run_audio_rx(
     socket: Arc<UdpSocket>,
     codec_type: CodecType,
+    payload_type: Arc<std::sync::atomic::AtomicU8>,
     running: Arc<AtomicBool>,
     mut decoder: Box<dyn AudioDecoder>,
     counters: RtpCounters,
@@ -1405,6 +1408,9 @@ fn run_audio_rx(
         let mut buf = [0u8; 2048];
         let mut last_transit: Option<i64> = None;
         let mut first_seq: Option<u16> = None;
+        // Payload types other than the audio one that have shown up, so each
+        // is logged once rather than per packet.
+        let mut other_pts_seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
 
         // Jitter buffer: 40ms target delay, adapts between 20-150ms
         let jitter_config = JitterConfig {
@@ -1505,6 +1511,25 @@ fn run_audio_rx(
 
                             // Push into jitter buffer instead of decoding immediately
                             if let Some((header, payload)) = parse_rtp(&rtp_data) {
+                                // Only the negotiated audio payload type goes
+                                // to the decoder. A peer's telephone-event
+                                // (DTMF) and comfort-noise packets share the
+                                // stream; handed to libopus they are "invalid
+                                // packet" errors, and to G.711 a burst of
+                                // noise. The jitter buffer treats the skipped
+                                // sequence numbers as loss and conceals them.
+                                let expected_pt = payload_type.load(Ordering::Relaxed);
+                                if header.payload_type != expected_pt {
+                                    if other_pts_seen.insert(header.payload_type) {
+                                        log::info!(
+                                            "Audio RX: ignoring RTP payload type {} ({} bytes); audio is on {}",
+                                            header.payload_type,
+                                            payload.len(),
+                                            expected_pt
+                                        );
+                                    }
+                                    continue;
+                                }
                                 let s = header.sequence;
                                 let t = header.timestamp;
                                 jitter_buf.push(s, t, payload.to_vec());
