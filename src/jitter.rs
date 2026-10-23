@@ -273,6 +273,16 @@ impl JitterBuffer {
         packet
     }
 
+    /// The packet that the next [`Self::pop`] will play, if it has arrived.
+    ///
+    /// `None` while playout has not started, or when that packet is missing
+    /// (in which case `pop` will synthesise a loss). After `pop` has returned
+    /// a synthesised packet, this is the packet that followed the lost one —
+    /// which is what a codec with in-band FEC needs to rebuild it.
+    pub fn peek_next(&self) -> Option<&BufferedPacket> {
+        self.packets.get(&self.playout_seq?)
+    }
+
     /// Get current statistics.
     pub fn stats(&self) -> JitterStats {
         let mut stats = self.stats.clone();
@@ -530,6 +540,39 @@ mod tests {
 
         let stats = jitter.stats();
         assert_eq!(stats.packets_lost, 1);
+    }
+
+    /// After a loss is popped, `peek_next` shows the packet that followed it
+    /// — the one carrying the FEC copy of the lost frame — and `None` when
+    /// that one is missing too.
+    #[test]
+    fn peek_next_shows_the_packet_after_a_loss() {
+        let config = JitterConfig {
+            mode: JitterMode::Fixed { delay_ms: 10 },
+            clock_rate: 8000,
+            max_packets: 10,
+        };
+        let mut jitter = JitterBuffer::new(config);
+        assert!(
+            jitter.peek_next().is_none(),
+            "nothing before playout starts"
+        );
+
+        jitter.push(0, 0, vec![1]);
+        jitter.push(2, 320, vec![3]);
+        sleep(Duration::from_millis(15));
+
+        jitter.pop().unwrap(); // seq 0
+        assert!(jitter.peek_next().is_none(), "seq 1 is missing");
+
+        let lost = jitter.pop().unwrap(); // seq 1, synthesised
+        assert!(lost.synthesized);
+        let next = jitter.peek_next().expect("seq 2 has arrived");
+        assert_eq!(next.seq, 2);
+        assert_eq!(next.payload, vec![3]);
+
+        jitter.pop().unwrap(); // seq 2
+        assert!(jitter.peek_next().is_none(), "seq 3 never arrived");
     }
 
     #[test]

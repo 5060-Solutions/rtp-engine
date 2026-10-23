@@ -72,7 +72,11 @@ impl RtcpPacket {
 /// * `ssrc` - Synchronization source identifier
 /// * `packets_sent` - Total RTP packets sent
 /// * `octets_sent` - Total payload octets sent
-pub fn build_rtcp_sr(ssrc: u32, packets_sent: u32, octets_sent: u32) -> Vec<u8> {
+/// * `rtp_ts` - The stream's RTP timestamp at this instant, on the codec's
+///   clock — i.e. the timestamp the next RTP packet will carry. The receiver
+///   pairs it with the NTP time to line the stream up against the wall clock,
+///   so it must be the stream's own counter, not a guess derived at 8 kHz.
+pub fn build_rtcp_sr(ssrc: u32, packets_sent: u32, octets_sent: u32, rtp_ts: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(28);
 
     // V=2, P=0, RC=0, PT=200 (SR)
@@ -94,8 +98,7 @@ pub fn build_rtcp_sr(ssrc: u32, packets_sent: u32, octets_sent: u32) -> Vec<u8> 
     buf.extend_from_slice(&(ntp_sec as u32).to_be_bytes());
     buf.extend_from_slice(&(ntp_frac as u32).to_be_bytes());
 
-    // RTP timestamp (approximate)
-    let rtp_ts = (now.as_millis() * 8) as u32; // 8kHz clock
+    // RTP timestamp, on the stream's own clock
     buf.extend_from_slice(&rtp_ts.to_be_bytes());
 
     // Sender's packet count
@@ -184,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_build_rtcp_sr() {
-        let sr = build_rtcp_sr(0x12345678, 100, 16000);
+        let sr = build_rtcp_sr(0x12345678, 100, 16000, 0);
 
         // Check header
         assert_eq!(sr[0] & 0xC0, 0x80); // V=2
@@ -193,6 +196,15 @@ mod tests {
         // Check SSRC
         let ssrc = u32::from_be_bytes([sr[4], sr[5], sr[6], sr[7]]);
         assert_eq!(ssrc, 0x12345678);
+    }
+
+    /// The SR carries the RTP timestamp it is given, verbatim: the stream's
+    /// own counter on the codec's clock, whatever rate that is.
+    #[test]
+    fn sr_carries_the_streams_rtp_timestamp() {
+        let sr = build_rtcp_sr(0x12345678, 100, 16000, 0xCAFE_F00D);
+        let rtp_ts = u32::from_be_bytes([sr[16], sr[17], sr[18], sr[19]]);
+        assert_eq!(rtp_ts, 0xCAFE_F00D);
     }
 
     #[test]
@@ -225,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_parse_rtcp() {
-        let sr = build_rtcp_sr(0x12345678, 100, 16000);
+        let sr = build_rtcp_sr(0x12345678, 100, 16000, 0);
         let parsed = RtcpPacket::parse(&sr).unwrap();
 
         assert_eq!(parsed.packet_type, RtcpType::SenderReport);
@@ -284,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_rtcp_sr_structure() {
-        let sr = build_rtcp_sr(0x12345678, 1000, 160000);
+        let sr = build_rtcp_sr(0x12345678, 1000, 160000, 0);
 
         // Length check: header(4) + SSRC(4) + NTP(8) + RTP-ts(4) + counts(8) = 28 bytes
         assert_eq!(sr.len(), 28);
