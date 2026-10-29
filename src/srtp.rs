@@ -176,14 +176,10 @@ impl SrtpContext {
 
         if first_packet {
             log::info!(
-                "SRTP TX: first packet - seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                "SRTP TX: first packet - seq={}, ssrc={}, roc={}",
                 seq,
                 ssrc,
-                self.roc,
-                self.session_key[0],
-                self.session_key[1],
-                self.session_key[2],
-                self.session_key[3]
+                self.roc
             );
         }
 
@@ -229,28 +225,20 @@ impl SrtpContext {
             compute_rtp_auth_tag(&self.session_auth_key, authenticated_portion, estimated_roc)?;
         if !constant_time_eq(&computed_tag, received_tag) {
             log::warn!(
-                "SRTP RX auth failed: seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                "SRTP RX auth failed: seq={}, ssrc={}, roc={}",
                 seq,
                 ssrc,
-                estimated_roc,
-                self.session_key[0],
-                self.session_key[1],
-                self.session_key[2],
-                self.session_key[3]
+                estimated_roc
             );
             return Err(Error::srtp("SRTP authentication failed"));
         }
 
         if first_packet {
             log::info!(
-                "SRTP RX: first packet - seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
+                "SRTP RX: first packet - seq={}, ssrc={}, roc={}",
                 seq,
                 ssrc,
-                estimated_roc,
-                self.session_key[0],
-                self.session_key[1],
-                self.session_key[2],
-                self.session_key[3]
+                estimated_roc
             );
             // Don't set initialized here - let update_roc handle it so it
             // correctly initializes s_l before any estimate_roc calls.
