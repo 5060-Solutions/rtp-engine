@@ -24,6 +24,11 @@ pub enum Error {
     #[error("SRTP error: {0}")]
     Srtp(String),
 
+    /// An SRTP or SRTCP packet that authenticated but was already received, or
+    /// is too old to tell (RFC 3711 §3.3.2). Dropped, never played.
+    #[error("SRTP replay: packet already received or outside the replay window")]
+    SrtpReplay,
+
     /// Audio device error.
     #[error("device error: {0}")]
     Device(String),
@@ -99,6 +104,8 @@ mod tests {
         let e = Error::srtp("test srtp error");
         assert!(matches!(e, Error::Srtp(_)));
         assert_eq!(format!("{}", e), "SRTP error: test srtp error");
+
+        assert!(format!("{}", Error::SrtpReplay).starts_with("SRTP replay"));
 
         let e = Error::device("test device error");
         assert!(matches!(e, Error::Device(_)));

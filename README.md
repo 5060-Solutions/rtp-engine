@@ -19,7 +19,7 @@ Similar in scope to PJMEDIA, but designed from the ground up for Rust with moder
 
 ## Features
 
-- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), Opus
+- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, G.729A, Opus
 - **RTP/RTCP**: Complete packet construction, parsing, and statistics per RFC 3550
 - **SRTP/SRTCP**: AES-CM-128-HMAC-SHA1-80 encryption per RFC 3711
 - **Jitter Buffer**: Adaptive and fixed modes with packet reordering and loss concealment
@@ -27,6 +27,7 @@ Similar in scope to PJMEDIA, but designed from the ground up for Rust with moder
 - **Echo Cancellation**: Optional AEC and noise suppression via WebRTC's audio processing module
 - **Resampling**: Automatic sample rate conversion between codecs and devices
 - **Symmetric RTP**: Comedia-style NAT traversal with learned endpoints
+- **Headless streams** (`stream` feature): a per-call `MediaStream` with PCM frames in and out, no audio device and no threads, for servers
 - **DTMF**: RFC 2833 telephone-event transmission
 - **Sequence Rollover**: Proper 16-bit sequence number rollover handling for long calls (22+ minutes)
 
