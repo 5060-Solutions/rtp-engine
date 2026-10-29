@@ -16,7 +16,6 @@ use crate::error::{Error, Result};
 use crate::recorder::{CallRecorder, RecorderHandle};
 #[cfg(feature = "device")]
 use crate::resample::{StreamResampler, f32_to_i16, i16_to_f32, resample_linear};
-#[cfg(feature = "device")]
 use crate::rtp::RtpHeader;
 use crate::rtp::{RtpCounters, RtpStats, build_rtcp_rr, build_rtcp_sr};
 #[cfg(feature = "device")]
@@ -818,7 +817,6 @@ fn dtmf_event_timestamp(audio_ts: u32, audio_clock_rate: u32, event_clock_rate: 
     (u64::from(audio_ts) * u64::from(event_clock_rate) / u64::from(audio_clock_rate)) as u32
 }
 
-#[cfg(feature = "device")]
 /// One RFC 4733 telephone-event RTP packet: a 12-byte header followed by the
 /// 4-byte event (event code, end flag + volume, 16-bit duration).
 #[allow(clippy::too_many_arguments)]
@@ -845,6 +843,8 @@ fn telephone_event_packet(
     packet
 }
 
+// Microphone capture: only exists with an audio device, like `run_audio_rx`.
+#[cfg(feature = "device")]
 fn run_audio_tx(
     socket: Arc<UdpSocket>,
     remote: SocketAddr,
@@ -1713,6 +1713,8 @@ async fn run_rtcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "device"))]
+    use crate::codec::{create_decoder, create_encoder};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
