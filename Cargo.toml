@@ -111,7 +111,7 @@ webrtc-audio-processing = { version = "2.1", features = ["bundled"], optional = 
 
 # High-quality audio resampling
 rubato = "1.0"
-audioadapter-buffers = "2.0"
+audioadapter-buffers = "5.2"
 
 # Timestamps for recording filenames
 chrono = "0.4"
