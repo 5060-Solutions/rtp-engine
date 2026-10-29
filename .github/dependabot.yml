@@ -1,0 +1,18 @@
+# Weekly dependency PRs: minor and patch updates grouped into one PR on Monday;
+# majors come separately. The crate declares rust-version 1.85, so a bump that
+# needs a newer toolchain fails CI rather than landing silently.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "09:00", timezone: America/New_York }
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "09:00", timezone: America/New_York }
+    groups:
+      actions:
+        patterns: ["*"]
