@@ -104,14 +104,14 @@ serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
 
 # Audio device (optional)
-cpal = { version = "0.17", optional = true }
+cpal = { version = "0.18", optional = true }
 
 # Echo cancellation / noise suppression (optional; builds C++ from source)
 webrtc-audio-processing = { version = "2.1", features = ["bundled"], optional = true }
 
 # High-quality audio resampling
-rubato = "1.0"
-audioadapter-buffers = "2.0"
+rubato = "5.0"
+audioadapter-buffers = "5.2"
 
 # Timestamps for recording filenames
 chrono = "0.4"
@@ -123,9 +123,9 @@ audiopus = { version = "0.3.0-rc.0", optional = true }
 # SRTP (optional)
 aes = { version = "0.8", optional = true }
 ctr = { version = "0.9", optional = true }
-hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
-base64 = "0.22"
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", optional = true }
+base64 = "0.23"
 
 # Async runtime for device threads
 tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sync", "macros"] }

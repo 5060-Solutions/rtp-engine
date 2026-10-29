@@ -981,7 +981,7 @@ fn run_audio_tx(
 
     let stream = device
         .build_input_stream(
-            &config,
+            config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if !cb_running.load(Ordering::Relaxed) {
                     return;
@@ -1377,7 +1377,7 @@ fn run_audio_rx(
 
     let stream = device
         .build_output_stream(
-            &config,
+            config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 fill_playback(data, &rx_buffer, &pb_started, pre_buffer_samples);
 
