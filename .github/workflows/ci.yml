@@ -26,7 +26,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-24.04, not ubuntu-latest: when GitHub moved the alias to 26.04
+        # the echo canceller test started failing, because the WebRTC audio
+        # processing C++ is built by the image's default g++ and the newer
+        # toolchain changes AEC3's numerics. See #15 before moving this back.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         rust: [stable, beta]
     steps:
       - uses: actions/checkout@v4
