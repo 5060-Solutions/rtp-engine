@@ -266,7 +266,15 @@ impl std::fmt::Debug for StreamCore {
 
 impl StreamCore {
     /// Set up a stream. SRTP is used in both directions when `srtp` is given.
+    ///
+    /// Refuses a telephone-event payload type equal to the audio one, which
+    /// would turn every audio packet into a digit.
     pub fn new(config: StreamConfig, srtp: Option<SrtpPair>) -> Result<Self> {
+        if config.dtmf_payload_type == Some(config.payload_type) {
+            return Err(Error::invalid_parameter(
+                "telephone-event and audio share a payload type",
+            ));
+        }
         let jitter = JitterBuffer::new(JitterConfig {
             mode: config.jitter,
             clock_rate: config.codec.clock_rate(),
@@ -414,8 +422,12 @@ impl StreamCore {
 
         if is_dtmf {
             // One press is one event timestamp; its updates and the three
-            // end packets repeat it (RFC 4733 §2.5.1).
-            if self.last_dtmf_timestamp == Some(header.timestamp) {
+            // end packets repeat it (RFC 4733 §2.5.1). Event timestamps only
+            // move forward, so a late packet of an earlier event (not newer
+            // than the last one, allowing for wrap) is not a new press.
+            if let Some(last) = self.last_dtmf_timestamp
+                && header.timestamp.wrapping_sub(last) as i32 <= 0
+            {
                 return Ok(None);
             }
             let Some(digit) = dtmf_digit(payload[0]) else {
@@ -594,6 +606,9 @@ impl StreamCore {
     }
 }
 
+/// The most RTCP datagrams one [`MediaStream::rtcp_tick`] discards.
+const RTCP_DRAIN_LIMIT: usize = 64;
+
 /// Whether a receive error is the ICMP echo of an earlier send to a closed
 /// port, which some platforms report on the next receive. Not fatal: the peer
 /// may simply not be listening yet.
@@ -707,8 +722,14 @@ impl MediaStream {
         let Some(rtcp) = self.rtcp.as_ref() else {
             return Ok(());
         };
+        // Bounded: try_recv is outside tokio's cooperative budget, and a flood
+        // on the RTCP port must not pin the runtime.
         let mut scratch = [0u8; 1500];
-        while rtcp.try_recv_from(&mut scratch).is_ok() {}
+        for _ in 0..RTCP_DRAIN_LIMIT {
+            if rtcp.try_recv_from(&mut scratch).is_err() {
+                break;
+            }
+        }
         let rtp = self.core.destination();
         let destination = SocketAddr::new(rtp.ip(), rtp.port().wrapping_add(1));
         let report = self.core.sender_report()?;

@@ -198,6 +198,50 @@ fn rfc4733_event_decoded_once_with_end_bit_repeats() {
     assert_eq!(digits, vec!['0', '0']);
 }
 
+/// A telephone-event payload type equal to the audio one would turn every
+/// audio packet into a digit: refused.
+#[test]
+fn dtmf_on_the_audio_payload_type_is_refused() {
+    let mut config = StreamConfig::new(CodecType::Pcmu, PEER);
+    config.dtmf_payload_type = Some(0);
+    assert!(StreamCore::new(config, None).is_err());
+}
+
+/// A late end packet of an earlier digit is not that digit pressed again:
+/// events older than the newest one seen are ignored (RFC 4733 timestamps
+/// only move forward within a stream).
+#[test]
+fn a_stale_event_is_not_a_new_press() {
+    let mut core = StreamCore::new(StreamConfig::new(CodecType::Pcmu, PEER), None).unwrap();
+    let now = Instant::now();
+    let event = |seq: u16, ts: u32, digit: u8, end: bool| {
+        let flags = if end { 0x8A } else { 0x0A };
+        rtp(101, seq, ts, 7, &[digit, flags, 0x01, 0xE0])
+    };
+    let mut digits = Vec::new();
+    for packet in [
+        event(1, 1000, 1, false),
+        event(2, 1000, 1, true),
+        event(3, 2000, 2, false),
+        event(4, 1000, 1, true),
+    ] {
+        if let Ok(Some(e)) = core.ingest(&packet, PEER, now) {
+            digits.push(e.digit);
+        }
+    }
+    assert_eq!(digits, vec!['1', '2']);
+
+    // Timestamps wrap: an event just past u32::MAX is newer, not older.
+    let mut core = StreamCore::new(StreamConfig::new(CodecType::Pcmu, PEER), None).unwrap();
+    let mut digits = Vec::new();
+    for packet in [event(5, u32::MAX - 100, 3, false), event(6, 50, 4, false)] {
+        if let Ok(Some(e)) = core.ingest(&packet, PEER, now) {
+            digits.push(e.digit);
+        }
+    }
+    assert_eq!(digits, vec!['3', '4']);
+}
+
 /// Packets that fail SRTP authentication are dropped and counted, never
 /// played, and never latch the stream to their source.
 #[test]
@@ -397,9 +441,24 @@ mod fuzz {
     use super::*;
     use proptest::prelude::*;
 
-    fn core(srtp: bool) -> StreamCore {
+    /// The codecs the fuzzers drive: every decoder sees arbitrary payloads.
+    fn codecs() -> Vec<CodecType> {
+        let mut codecs = vec![CodecType::Pcmu, CodecType::Pcma, CodecType::G722];
+        #[cfg(feature = "opus")]
+        codecs.push(CodecType::Opus);
+        codecs
+    }
+
+    fn core(srtp: bool, codec: usize) -> StreamCore {
         let keys = srtp.then(|| srtp_pairs().1);
-        StreamCore::new(StreamConfig::new(CodecType::Pcmu, PEER), keys).unwrap()
+        let codecs = codecs();
+        let codec = codecs[codec % codecs.len()];
+        StreamCore::new(StreamConfig::new(codec, PEER), keys).unwrap()
+    }
+
+    fn core_payload_type(codec: usize) -> u8 {
+        let codecs = codecs();
+        codecs[codec % codecs.len()].payload_type()
     }
 
     proptest! {
@@ -411,8 +470,9 @@ mod fuzz {
         fn arbitrary_datagrams_never_panic(
             datagrams in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..300), 1..20),
             srtp in any::<bool>(),
+            codec in any::<usize>(),
         ) {
-            let mut core = core(srtp);
+            let mut core = core(srtp, codec);
             let t0 = Instant::now();
             for (n, datagram) in datagrams.iter().enumerate() {
                 let _ = core.ingest(datagram, PEER, t0 + Duration::from_millis(n as u64 * 20));
@@ -430,9 +490,12 @@ mod fuzz {
             seq in any::<u16>(),
             payload in proptest::collection::vec(any::<u8>(), 0..200),
             cut in 0usize..240,
+            codec in any::<usize>(),
         ) {
-            let mut core = core(false);
-            let mut packet = rtp(pt & 0x7F, seq, 0, 1, &payload);
+            let mut core = core(false, codec);
+            // Mostly on the audio payload type, so the decoder runs.
+            let pt = if pt % 4 == 0 { pt & 0x7F } else { core_payload_type(codec) };
+            let mut packet = rtp(pt, seq, 0, 1, &payload);
             packet[0] = 0x80 | (first & 0x3F);
             packet.truncate(cut.max(1));
             let now = Instant::now();
