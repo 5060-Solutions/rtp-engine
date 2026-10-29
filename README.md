@@ -27,6 +27,7 @@ Similar in scope to PJMEDIA, but designed from the ground up for Rust with moder
 - **Echo Cancellation**: Optional AEC and noise suppression via WebRTC's audio processing module
 - **Resampling**: Automatic sample rate conversion between codecs and devices
 - **Symmetric RTP**: Comedia-style NAT traversal with learned endpoints
+- **Headless streams** (`stream` feature): a per-call `MediaStream` with PCM frames in and out, no audio device and no threads, for servers
 - **DTMF**: RFC 2833 telephone-event transmission
 - **Sequence Rollover**: Proper 16-bit sequence number rollover handling for long calls (22+ minutes)
 
