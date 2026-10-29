@@ -104,7 +104,7 @@ serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
 
 # Audio device (optional)
-cpal = { version = "0.17", optional = true }
+cpal = { version = "0.18", optional = true }
 
 # Echo cancellation / noise suppression (optional; builds C++ from source)
 webrtc-audio-processing = { version = "2.1", features = ["bundled"], optional = true }
