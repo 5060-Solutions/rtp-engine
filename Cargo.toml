@@ -124,7 +124,7 @@ audiopus = { version = "0.3.0-rc.0", optional = true }
 aes = { version = "0.8", optional = true }
 ctr = { version = "0.9", optional = true }
 hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
+sha1 = { version = "0.11", optional = true }
 base64 = "0.22"
 
 # Async runtime for device threads
