@@ -49,10 +49,13 @@ const LABEL_RTCP_CIPHER: u8 = 0x03;
 const LABEL_RTCP_AUTH: u8 = 0x04;
 const LABEL_RTCP_SALT: u8 = 0x05;
 
-/// How many sources' receive state a context remembers. A call has one remote
-/// SSRC, occasionally two across a re-INVITE or a PBX re-anchoring the media;
-/// the cap bounds memory against a peer that keeps changing it.
-const MAX_RX_SOURCES: usize = 4;
+/// How many remote sources a context keeps receive state for. A call has one
+/// remote SSRC, a few across holds, announcements and re-anchoring. A source
+/// is never forgotten: one that came back with a blank replay window would
+/// accept every packet ever recorded from it once more. So past this bound new
+/// sources are refused, which bounds memory and costs only a peer that keeps
+/// changing SSRC its own audio.
+const MAX_RX_SOURCES: usize = 64;
 
 /// The replay window size in packets (RFC 3711 §3.3.2 asks for at least 64).
 const REPLAY_WINDOW: u64 = 64;
@@ -162,10 +165,10 @@ pub struct SrtpContext {
     rtcp_session_salt: [u8; SESSION_SALT_LEN],
     rtcp_session_auth_key: [u8; SESSION_AUTH_KEY_LEN],
     tx: SendState,
-    /// Receive state per remote SSRC, most recently used first.
+    /// Receive state per remote SSRC, never evicted (see [`MAX_RX_SOURCES`]).
     rx: Vec<RecvState>,
     srtcp_index: u32,
-    /// SRTCP replay windows per remote SSRC, most recently used first.
+    /// SRTCP replay windows per remote SSRC, never evicted.
     rtcp_rx: Vec<(u32, ReplayWindow)>,
 }
 
@@ -311,6 +314,9 @@ impl SrtpContext {
         ]);
 
         let position = self.rx.iter().position(|state| state.ssrc == ssrc);
+        if position.is_none() && self.rx.len() >= MAX_RX_SOURCES {
+            return Err(Error::srtp("too many SRTP sources"));
+        }
         let state = position.map_or_else(|| RecvState::new(ssrc), |i| self.rx[i]);
         let estimated_roc = state.estimate_roc(seq);
 
@@ -347,14 +353,13 @@ impl SrtpContext {
         Ok(output)
     }
 
-    /// Store a source's receive state at the front of the list, evicting the
-    /// least recently used source beyond [`MAX_RX_SOURCES`].
+    /// Store a source's receive state. Never evicts: the caller has already
+    /// refused a new source beyond [`MAX_RX_SOURCES`].
     fn remember_source(&mut self, position: Option<usize>, state: RecvState) {
-        if let Some(i) = position {
-            self.rx.remove(i);
+        match position {
+            Some(i) => self.rx[i] = state,
+            None => self.rx.push(state),
         }
-        self.rx.insert(0, state);
-        self.rx.truncate(MAX_RX_SOURCES);
     }
 
     /// Encrypt and authenticate an RTCP packet.
@@ -422,16 +427,18 @@ impl SrtpContext {
             authenticated_portion[7],
         ]);
         let position = self.rtcp_rx.iter().position(|(s, _)| *s == ssrc);
+        if position.is_none() && self.rtcp_rx.len() >= MAX_RX_SOURCES {
+            return Err(Error::srtp("too many SRTCP sources"));
+        }
         let mut window = position.map_or_else(ReplayWindow::default, |i| self.rtcp_rx[i].1);
         if !window.admits(u64::from(index)) {
             return Err(Error::SrtpReplay);
         }
         window.accept(u64::from(index));
-        if let Some(i) = position {
-            self.rtcp_rx.remove(i);
+        match position {
+            Some(i) => self.rtcp_rx[i].1 = window,
+            None => self.rtcp_rx.push((ssrc, window)),
         }
-        self.rtcp_rx.insert(0, (ssrc, window));
-        self.rtcp_rx.truncate(MAX_RX_SOURCES);
 
         let mut output = authenticated_portion[..index_offset].to_vec();
 
@@ -576,15 +583,12 @@ fn prf_aes_cm(master_key: &[u8], master_salt: &[u8], label: u8, output: &mut [u8
     Ok(())
 }
 
+/// Compare authentication tags in constant time, so a forger learns nothing
+/// from how long a refusal takes. `subtle` keeps the optimizer from turning
+/// the comparison back into an early exit.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// Parse an `a=crypto` attribute from SDP.
@@ -1140,6 +1144,67 @@ mod tests {
             rx.unprotect_rtp(&tampered).is_err(),
             "the extension is authenticated"
         );
+    }
+
+    /// Forgetting a source would let every packet ever recorded from it be
+    /// replayed once more when it reappears. Sources beyond the bound are
+    /// refused instead, and a source seen before keeps its window.
+    #[test]
+    fn a_returning_source_keeps_its_replay_window() {
+        let (tx, b64) = SrtpContext::generate().unwrap();
+        drop(tx);
+        let mut rx = SrtpContext::from_base64(&b64).unwrap();
+        let sender = |ssrc: u32, seq: u16| {
+            let mut ctx = SrtpContext::from_base64(&b64).unwrap();
+            ctx.protect_rtp(&rtp_packet(ssrc, seq)).unwrap()
+        };
+        let first = sender(1, 10);
+        rx.unprotect_rtp(&first).unwrap();
+        for ssrc in 2..=5 {
+            rx.unprotect_rtp(&sender(ssrc, 10)).unwrap();
+        }
+        assert!(matches!(rx.unprotect_rtp(&first), Err(Error::SrtpReplay)));
+    }
+
+    #[test]
+    fn sources_beyond_the_bound_are_refused_not_evicted() {
+        let (_, b64) = SrtpContext::generate().unwrap();
+        let mut rx = SrtpContext::from_base64(&b64).unwrap();
+        let sender = |ssrc: u32| {
+            let mut ctx = SrtpContext::from_base64(&b64).unwrap();
+            ctx.protect_rtp(&rtp_packet(ssrc, 10)).unwrap()
+        };
+        let first = sender(1);
+        rx.unprotect_rtp(&first).unwrap();
+        for ssrc in 2..=u32::try_from(MAX_RX_SOURCES).unwrap() {
+            rx.unprotect_rtp(&sender(ssrc)).unwrap();
+        }
+        let one_too_many = u32::try_from(MAX_RX_SOURCES).unwrap() + 1;
+        assert!(matches!(
+            rx.unprotect_rtp(&sender(one_too_many)),
+            Err(Error::Srtp(_))
+        ));
+        assert!(matches!(rx.unprotect_rtp(&first), Err(Error::SrtpReplay)));
+    }
+
+    #[test]
+    fn a_returning_srtcp_source_keeps_its_replay_window() {
+        let (_, b64) = SrtpContext::generate().unwrap();
+        let mut rx = SrtpContext::from_base64(&b64).unwrap();
+        let report = |ssrc: u32| {
+            let mut ctx = SrtpContext::from_base64(&b64).unwrap();
+            let mut rtcp = vec![0x80, 200];
+            rtcp.extend_from_slice(&6u16.to_be_bytes());
+            rtcp.extend_from_slice(&ssrc.to_be_bytes());
+            rtcp.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            ctx.protect_rtcp(&rtcp).unwrap()
+        };
+        let first = report(1);
+        rx.unprotect_rtcp(&first).unwrap();
+        for ssrc in 2..=5 {
+            rx.unprotect_rtcp(&report(ssrc)).unwrap();
+        }
+        assert!(matches!(rx.unprotect_rtcp(&first), Err(Error::SrtpReplay)));
     }
 
     #[test]
