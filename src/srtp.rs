@@ -49,9 +49,111 @@ const LABEL_RTCP_CIPHER: u8 = 0x03;
 const LABEL_RTCP_AUTH: u8 = 0x04;
 const LABEL_RTCP_SALT: u8 = 0x05;
 
+/// How many sources' receive state a context remembers. A call has one remote
+/// SSRC, occasionally two across a re-INVITE or a PBX re-anchoring the media;
+/// the cap bounds memory against a peer that keeps changing it.
+const MAX_RX_SOURCES: usize = 4;
+
+/// The replay window size in packets (RFC 3711 §3.3.2 asks for at least 64).
+const REPLAY_WINDOW: u64 = 64;
+
+/// The sliding replay window of RFC 3711 §3.3.2 over one source's packet
+/// indices: the highest index authenticated so far, and a bitmap of which of
+/// the 64 indices at and below it have been seen.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplayWindow {
+    highest: Option<u64>,
+    seen: u64,
+}
+
+impl ReplayWindow {
+    /// Whether `index` may be accepted: newer than anything seen, or inside
+    /// the window and not yet seen.
+    fn admits(&self, index: u64) -> bool {
+        let Some(highest) = self.highest else {
+            return true;
+        };
+        if index > highest {
+            return true;
+        }
+        let behind = highest - index;
+        behind < REPLAY_WINDOW && self.seen & (1 << behind) == 0
+    }
+
+    /// Record `index` as received. Only called after it authenticated.
+    fn accept(&mut self, index: u64) {
+        match self.highest {
+            Some(highest) if index <= highest => self.seen |= 1 << (highest - index),
+            Some(highest) => {
+                let ahead = index - highest;
+                self.seen = if ahead >= REPLAY_WINDOW {
+                    0
+                } else {
+                    self.seen << ahead
+                };
+                self.seen |= 1;
+                self.highest = Some(index);
+            }
+            None => {
+                self.seen = 1;
+                self.highest = Some(index);
+            }
+        }
+    }
+}
+
+/// The rollover counter and sequence number this context sends with.
+#[derive(Debug, Clone, Copy, Default)]
+struct SendState {
+    roc: u32,
+    s_l: u16,
+    initialized: bool,
+}
+
+/// What a receiver knows about one remote source: the ROC and sequence number
+/// of the highest packet index it has authenticated, and the replay window.
+#[derive(Debug, Clone, Copy)]
+struct RecvState {
+    ssrc: u32,
+    roc: u32,
+    s_l: u16,
+    window: ReplayWindow,
+}
+
+impl RecvState {
+    fn new(ssrc: u32) -> Self {
+        Self {
+            ssrc,
+            roc: 0,
+            s_l: 0,
+            window: ReplayWindow::default(),
+        }
+    }
+
+    /// The ROC a packet with sequence number `seq` most likely carries
+    /// (RFC 3711 Appendix A), judged against the highest index seen.
+    fn estimate_roc(&self, seq: u16) -> u32 {
+        if self.window.highest.is_none() {
+            return self.roc;
+        }
+        let diff = i32::from(seq) - i32::from(self.s_l);
+        if diff > 0x8000 {
+            // Numerically far ahead, so really a late packet from before the
+            // last wrap.
+            self.roc.wrapping_sub(1)
+        } else if diff < -0x8000 {
+            // Numerically far behind, so the sequence has wrapped.
+            self.roc.wrapping_add(1)
+        } else {
+            self.roc
+        }
+    }
+}
+
 /// SRTP cryptographic context for a single media session.
 ///
-/// Maintains session keys and rollover counter for sequence number tracking.
+/// Maintains session keys, the rollover counter for sending, and per-source
+/// receive state with a replay window (RFC 3711 §3.3.2).
 pub struct SrtpContext {
     session_key: [u8; SESSION_KEY_LEN],
     session_salt: [u8; SESSION_SALT_LEN],
@@ -59,10 +161,24 @@ pub struct SrtpContext {
     rtcp_session_key: [u8; SESSION_KEY_LEN],
     rtcp_session_salt: [u8; SESSION_SALT_LEN],
     rtcp_session_auth_key: [u8; SESSION_AUTH_KEY_LEN],
-    roc: u32,
-    s_l: u16,
-    initialized: bool,
+    tx: SendState,
+    /// Receive state per remote SSRC, most recently used first.
+    rx: Vec<RecvState>,
     srtcp_index: u32,
+    /// SRTCP replay windows per remote SSRC, most recently used first.
+    rtcp_rx: Vec<(u32, ReplayWindow)>,
+}
+
+/// The length of an RTP header including CSRCs and any header extension
+/// (RFC 3550 §5.3.1), or `None` when the packet is too short to hold it.
+fn rtp_header_len(packet: &[u8]) -> Option<usize> {
+    let cc = usize::from(*packet.first()? & 0x0F);
+    let mut len = 12 + cc * 4;
+    if packet[0] & 0x10 != 0 {
+        let words = packet.get(len + 2..len + 4)?;
+        len += 4 + usize::from(u16::from_be_bytes([words[0], words[1]])) * 4;
+    }
+    (packet.len() >= len).then_some(len)
 }
 
 impl SrtpContext {
@@ -102,10 +218,10 @@ impl SrtpContext {
             rtcp_session_key,
             rtcp_session_salt,
             rtcp_session_auth_key,
-            roc: 0,
-            s_l: 0,
-            initialized: false,
+            tx: SendState::default(),
+            rx: Vec::new(),
             srtcp_index: 0,
+            rtcp_rx: Vec::new(),
         })
     }
 
@@ -122,17 +238,6 @@ impl SrtpContext {
                 KEYING_MATERIAL_LEN
             )));
         }
-        log::debug!(
-            "SRTP from_base64: master_key[0..4]={:02x}{:02x}{:02x}{:02x}, salt[0..4]={:02x}{:02x}{:02x}{:02x}",
-            decoded[0],
-            decoded[1],
-            decoded[2],
-            decoded[3],
-            decoded[MASTER_KEY_LEN],
-            decoded[MASTER_KEY_LEN + 1],
-            decoded[MASTER_KEY_LEN + 2],
-            decoded[MASTER_KEY_LEN + 3]
-        );
         Self::new(
             &decoded[..MASTER_KEY_LEN],
             &decoded[MASTER_KEY_LEN..KEYING_MATERIAL_LEN],
@@ -153,62 +258,49 @@ impl SrtpContext {
         if rtp_packet.len() < 12 {
             return Err(Error::rtp("RTP packet too short"));
         }
-
-        let cc = (rtp_packet[0] & 0x0F) as usize;
-        let header_len = 12 + cc * 4;
-        if rtp_packet.len() < header_len {
-            return Err(Error::rtp("RTP packet truncated"));
-        }
+        let header_len =
+            rtp_header_len(rtp_packet).ok_or_else(|| Error::rtp("RTP packet truncated"))?;
 
         let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
         let ssrc =
             u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
 
         // Update ROC for sending
-        let first_packet = !self.initialized;
-        if !self.initialized {
-            self.s_l = seq;
-            self.initialized = true;
-        } else if seq == 0 && self.s_l == 0xFFFF {
-            self.roc = self.roc.wrapping_add(1);
+        if !self.tx.initialized {
+            self.tx.initialized = true;
+            log::debug!("SRTP TX: first packet, seq={seq}, ssrc={ssrc}");
+        } else if seq == 0 && self.tx.s_l == 0xFFFF {
+            self.tx.roc = self.tx.roc.wrapping_add(1);
         }
-        self.s_l = seq;
+        self.tx.s_l = seq;
 
-        if first_packet {
-            log::info!(
-                "SRTP TX: first packet - seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
-                seq,
-                ssrc,
-                self.roc,
-                self.session_key[0],
-                self.session_key[1],
-                self.session_key[2],
-                self.session_key[3]
-            );
-        }
-
-        let iv = build_iv(&self.session_salt, ssrc, self.roc, seq);
+        let iv = build_iv(&self.session_salt, ssrc, self.tx.roc, seq);
 
         let mut output = rtp_packet.to_vec();
         aes_128_cm_encrypt(&self.session_key, &iv, &mut output[header_len..])?;
 
-        let tag = compute_rtp_auth_tag(&self.session_auth_key, &output, self.roc)?;
+        let tag = compute_rtp_auth_tag(&self.session_auth_key, &output, self.tx.roc)?;
         output.extend_from_slice(&tag);
 
         Ok(output)
     }
 
     /// Verify and decrypt an SRTP packet.
+    ///
+    /// Fails with [`Error::Srtp`] when the packet is malformed or does not
+    /// authenticate, and with [`Error::SrtpReplay`] when it authenticates but
+    /// was already received or is older than the replay window. Neither moves
+    /// the receive state.
     pub fn unprotect_rtp(&mut self, srtp_packet: &[u8]) -> Result<Vec<u8>> {
         if srtp_packet.len() < 12 + AUTH_TAG_LEN {
             return Err(Error::srtp("SRTP packet too short"));
         }
 
-        let cc = (srtp_packet[0] & 0x0F) as usize;
-        let header_len = 12 + cc * 4;
-        if srtp_packet.len() < header_len + AUTH_TAG_LEN {
-            return Err(Error::srtp("SRTP packet truncated"));
-        }
+        let auth_boundary = srtp_packet.len() - AUTH_TAG_LEN;
+        let authenticated_portion = &srtp_packet[..auth_boundary];
+        let received_tag = &srtp_packet[auth_boundary..];
+        let header_len = rtp_header_len(authenticated_portion)
+            .ok_or_else(|| Error::srtp("SRTP packet truncated"))?;
 
         let seq = u16::from_be_bytes([srtp_packet[2], srtp_packet[3]]);
         let ssrc = u32::from_be_bytes([
@@ -218,51 +310,51 @@ impl SrtpContext {
             srtp_packet[11],
         ]);
 
-        let first_packet = !self.initialized;
-        let estimated_roc = self.estimate_roc(seq);
-
-        let auth_boundary = srtp_packet.len() - AUTH_TAG_LEN;
-        let authenticated_portion = &srtp_packet[..auth_boundary];
-        let received_tag = &srtp_packet[auth_boundary..];
+        let position = self.rx.iter().position(|state| state.ssrc == ssrc);
+        let state = position.map_or_else(|| RecvState::new(ssrc), |i| self.rx[i]);
+        let estimated_roc = state.estimate_roc(seq);
 
         let computed_tag =
             compute_rtp_auth_tag(&self.session_auth_key, authenticated_portion, estimated_roc)?;
         if !constant_time_eq(&computed_tag, received_tag) {
-            log::warn!(
-                "SRTP RX auth failed: seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
-                seq,
-                ssrc,
-                estimated_roc,
-                self.session_key[0],
-                self.session_key[1],
-                self.session_key[2],
-                self.session_key[3]
-            );
+            // Debug, not warn: a peer or an attacker sending garbage at line
+            // rate would otherwise flood the log. Callers count these.
+            log::debug!("SRTP RX: authentication failed, seq={seq}, ssrc={ssrc}");
             return Err(Error::srtp("SRTP authentication failed"));
         }
 
-        if first_packet {
-            log::info!(
-                "SRTP RX: first packet - seq={}, ssrc={}, roc={}, session_key[0..4]={:02x}{:02x}{:02x}{:02x}",
-                seq,
-                ssrc,
-                estimated_roc,
-                self.session_key[0],
-                self.session_key[1],
-                self.session_key[2],
-                self.session_key[3]
-            );
-            // Don't set initialized here - let update_roc handle it so it
-            // correctly initializes s_l before any estimate_roc calls.
+        let index = (u64::from(estimated_roc) << 16) | u64::from(seq);
+        if !state.window.admits(index) {
+            log::debug!("SRTP RX: replayed or stale packet dropped, seq={seq}, ssrc={ssrc}");
+            return Err(Error::SrtpReplay);
         }
 
-        self.update_roc(seq);
+        let mut state = state;
+        if state.window.highest.is_none_or(|highest| index > highest) {
+            state.roc = estimated_roc;
+            state.s_l = seq;
+        }
+        state.window.accept(index);
+        if position.is_none() {
+            log::debug!("SRTP RX: first packet from ssrc={ssrc}, seq={seq}");
+        }
+        self.remember_source(position, state);
 
         let iv = build_iv(&self.session_salt, ssrc, estimated_roc, seq);
         let mut output = authenticated_portion.to_vec();
         aes_128_cm_encrypt(&self.session_key, &iv, &mut output[header_len..])?;
 
         Ok(output)
+    }
+
+    /// Store a source's receive state at the front of the list, evicting the
+    /// least recently used source beyond [`MAX_RX_SOURCES`].
+    fn remember_source(&mut self, position: Option<usize>, state: RecvState) {
+        if let Some(i) = position {
+            self.rx.remove(i);
+        }
+        self.rx.insert(0, state);
+        self.rx.truncate(MAX_RX_SOURCES);
     }
 
     /// Encrypt and authenticate an RTCP packet.
@@ -323,6 +415,24 @@ impl SrtpContext {
         let encrypted = (e_index & 0x8000_0000) != 0;
         let index = e_index & 0x7FFF_FFFF;
 
+        let ssrc = u32::from_be_bytes([
+            authenticated_portion[4],
+            authenticated_portion[5],
+            authenticated_portion[6],
+            authenticated_portion[7],
+        ]);
+        let position = self.rtcp_rx.iter().position(|(s, _)| *s == ssrc);
+        let mut window = position.map_or_else(ReplayWindow::default, |i| self.rtcp_rx[i].1);
+        if !window.admits(u64::from(index)) {
+            return Err(Error::SrtpReplay);
+        }
+        window.accept(u64::from(index));
+        if let Some(i) = position {
+            self.rtcp_rx.remove(i);
+        }
+        self.rtcp_rx.insert(0, (ssrc, window));
+        self.rtcp_rx.truncate(MAX_RX_SOURCES);
+
         let mut output = authenticated_portion[..index_offset].to_vec();
 
         if encrypted && output.len() > 8 {
@@ -334,65 +444,23 @@ impl SrtpContext {
         Ok(output)
     }
 
-    /// Estimate the ROC (Rollover Counter) for a received sequence number.
-    ///
-    /// RFC 3711 Appendix A: The algorithm uses signed arithmetic to detect
-    /// whether a sequence number has wrapped around.
-    fn estimate_roc(&self, seq: u16) -> u32 {
-        if !self.initialized {
-            return 0;
-        }
-
-        // Compute signed difference between seq and last seen sequence
-        // This correctly handles the 16-bit wrap-around
-        let diff = (seq as i32) - (self.s_l as i32);
-
-        if diff > 0x8000 {
-            // seq appears much larger than s_l, but it's actually a late packet
-            // from before the current ROC (seq wrapped backward from our perspective)
-            self.roc.wrapping_sub(1)
-        } else if diff < -0x8000 {
-            // s_l appears much larger than seq, meaning seq has rolled over
-            // to a new ROC cycle (seq wrapped forward)
-            self.roc.wrapping_add(1)
-        } else {
-            // Normal case: seq and s_l are within half the sequence space
-            self.roc
-        }
-    }
-
-    /// Update ROC state after successfully authenticating a packet.
-    fn update_roc(&mut self, seq: u16) {
-        if !self.initialized {
-            self.s_l = seq;
-            self.initialized = true;
-            return;
-        }
-
-        let estimated = self.estimate_roc(seq);
-
-        // Update ROC if it changed
-        if estimated != self.roc {
-            self.roc = estimated;
-        }
-
-        // Update s_l (highest sequence seen in current ROC)
-        // Use signed difference to handle rollover edge case
-        let diff = (seq as i32) - (self.s_l as i32);
-        if diff > 0 || diff < -0x8000 {
-            // seq > s_l normally, OR seq rolled over to new ROC
-            self.s_l = seq;
-        }
+    /// The receive ROC for `ssrc`, for tests.
+    #[cfg(test)]
+    fn rx_roc(&self, ssrc: u32) -> Option<u32> {
+        self.rx
+            .iter()
+            .find(|state| state.ssrc == ssrc)
+            .map(|state| state.roc)
     }
 }
 
 impl std::fmt::Debug for SrtpContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SrtpContext")
-            .field("initialized", &self.initialized)
-            .field("roc", &self.roc)
-            .field("s_l", &self.s_l)
-            .finish()
+            .field("initialized", &self.tx.initialized)
+            .field("tx_roc", &self.tx.roc)
+            .field("rx_sources", &self.rx.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -687,8 +755,12 @@ mod tests {
         }
 
         // Verify ROC state - sender should have incremented ROC
-        assert_eq!(ctx_send.roc, 1, "Sender ROC should be 1 after rollover");
-        assert_eq!(ctx_recv.roc, 1, "Receiver ROC should be 1 after rollover");
+        assert_eq!(ctx_send.tx.roc, 1, "Sender ROC should be 1 after rollover");
+        assert_eq!(
+            ctx_recv.rx_roc(0x12345678),
+            Some(1),
+            "Receiver ROC should be 1 after rollover"
+        );
     }
 
     #[test]
@@ -713,8 +785,8 @@ mod tests {
             assert_eq!(decrypted, rtp, "First rollover failed at seq {}", seq);
         }
 
-        assert_eq!(ctx_send.roc, 1);
-        assert_eq!(ctx_recv.roc, 1);
+        assert_eq!(ctx_send.tx.roc, 1);
+        assert_eq!(ctx_recv.rx_roc(0x12345678), Some(1));
 
         // Continue from where we left off (seq 6 after rollover from 65535 to 0)
         // Now go through second rollover
@@ -738,8 +810,8 @@ mod tests {
         }
 
         // ROC should still be 1 (no rollover yet)
-        assert_eq!(ctx_send.roc, 1);
-        assert_eq!(ctx_recv.roc, 1);
+        assert_eq!(ctx_send.tx.roc, 1);
+        assert_eq!(ctx_recv.rx_roc(0x12345678), Some(1));
 
         // Now second rollover: 65530 -> 65535 -> 0 -> 5
         for i in 0u16..12 {
@@ -759,11 +831,12 @@ mod tests {
 
         // After second rollover
         assert_eq!(
-            ctx_send.roc, 2,
+            ctx_send.tx.roc, 2,
             "Sender ROC should be 2 after second rollover"
         );
         assert_eq!(
-            ctx_recv.roc, 2,
+            ctx_recv.rx_roc(0x12345678),
+            Some(2),
             "Receiver ROC should be 2 after second rollover"
         );
     }
@@ -913,6 +986,160 @@ mod tests {
         let debug_str = format!("{:?}", ctx);
         assert!(debug_str.contains("SrtpContext"));
         assert!(debug_str.contains("initialized"));
+    }
+
+    /// An RTP packet with the given SSRC and sequence number, its timestamp
+    /// following the sequence at 20 ms of 8 kHz.
+    fn rtp_packet(ssrc: u32, seq: u16) -> Vec<u8> {
+        let mut rtp = vec![0x80, 0x00];
+        rtp.extend_from_slice(&seq.to_be_bytes());
+        rtp.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+        rtp.extend_from_slice(&ssrc.to_be_bytes());
+        rtp.extend_from_slice(&[seq as u8; 8]);
+        rtp
+    }
+
+    fn pair() -> (SrtpContext, SrtpContext) {
+        let (tx, b64) = SrtpContext::generate().unwrap();
+        let rx = SrtpContext::from_base64(&b64).unwrap();
+        (tx, rx)
+    }
+
+    /// RFC 3711 §3.3.2: a packet that authenticates but was already received
+    /// must be dropped, or a captured stream can be played back into a call.
+    #[test]
+    fn a_replayed_rtp_packet_is_refused() {
+        let (mut tx, mut rx) = pair();
+        let packet = tx.protect_rtp(&rtp_packet(0x1234_5678, 100)).unwrap();
+        assert!(rx.unprotect_rtp(&packet).is_ok());
+        assert!(matches!(rx.unprotect_rtp(&packet), Err(Error::SrtpReplay)));
+    }
+
+    #[test]
+    fn a_late_packet_inside_the_window_is_accepted_once() {
+        let (mut tx, mut rx) = pair();
+        let packets: Vec<Vec<u8>> = (0u16..40)
+            .map(|seq| tx.protect_rtp(&rtp_packet(7, seq)).unwrap())
+            .collect();
+        for packet in &packets[20..] {
+            rx.unprotect_rtp(packet).unwrap();
+        }
+        // 20 packets behind the newest: late, but inside the 64-packet window.
+        assert!(rx.unprotect_rtp(&packets[5]).is_ok());
+        assert!(matches!(
+            rx.unprotect_rtp(&packets[5]),
+            Err(Error::SrtpReplay)
+        ));
+    }
+
+    #[test]
+    fn a_packet_older_than_the_window_is_refused() {
+        let (mut tx, mut rx) = pair();
+        let old = tx.protect_rtp(&rtp_packet(7, 0)).unwrap();
+        for seq in 1u16..=100 {
+            rx.unprotect_rtp(&tx.protect_rtp(&rtp_packet(7, seq)).unwrap())
+                .unwrap();
+        }
+        assert!(matches!(rx.unprotect_rtp(&old), Err(Error::SrtpReplay)));
+    }
+
+    /// A forged packet must not advance the window: if it did, one bogus
+    /// packet with a high sequence number would make every real packet look
+    /// stale.
+    #[test]
+    fn a_packet_that_fails_authentication_leaves_the_window_alone() {
+        let (mut tx, mut rx) = pair();
+        rx.unprotect_rtp(&tx.protect_rtp(&rtp_packet(7, 10)).unwrap())
+            .unwrap();
+        let mut forged = tx.protect_rtp(&rtp_packet(7, 30_000)).unwrap();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert!(matches!(rx.unprotect_rtp(&forged), Err(Error::Srtp(_))));
+        let next = tx.protect_rtp(&rtp_packet(7, 11)).unwrap();
+        assert!(rx.unprotect_rtp(&next).is_ok());
+    }
+
+    /// A packet from just before a rollover, arriving after it, belongs to the
+    /// previous ROC. Accepting it must not move the receiver back a cycle, or
+    /// every packet after it fails authentication for the rest of the call.
+    #[test]
+    fn a_late_packet_does_not_rewind_the_rollover_counter() {
+        let (mut tx, mut rx) = pair();
+        let mut packets = Vec::new();
+        for seq in [65_533u16, 65_534, 65_535, 0, 1, 2, 3] {
+            packets.push(tx.protect_rtp(&rtp_packet(9, seq)).unwrap());
+        }
+        // 65533, 65535, 0, 1 arrive; 65534 is late.
+        for index in [0, 2, 3, 4] {
+            rx.unprotect_rtp(&packets[index]).unwrap();
+        }
+        rx.unprotect_rtp(&packets[1]).unwrap();
+        rx.unprotect_rtp(&packets[5]).unwrap();
+        rx.unprotect_rtp(&packets[6]).unwrap();
+    }
+
+    /// Each SSRC has its own index space (RFC 3711 §3.2.1), so a second
+    /// source starting at a low sequence number is not "old", and switching
+    /// back does not reopen the first source's window to replays.
+    #[test]
+    fn each_ssrc_keeps_its_own_replay_state() {
+        let (mut tx, b64) = SrtpContext::generate().unwrap();
+        let mut rx = SrtpContext::from_base64(&b64).unwrap();
+        let first: Vec<Vec<u8>> = (1000u16..1010)
+            .map(|seq| tx.protect_rtp(&rtp_packet(1, seq)).unwrap())
+            .collect();
+        for packet in &first {
+            rx.unprotect_rtp(packet).unwrap();
+        }
+        let mut tx2 = SrtpContext::from_base64(&b64).unwrap();
+        let second = tx2.protect_rtp(&rtp_packet(2, 5)).unwrap();
+        assert!(rx.unprotect_rtp(&second).is_ok(), "a new SSRC starts fresh");
+        assert!(matches!(
+            rx.unprotect_rtp(&first[9]),
+            Err(Error::SrtpReplay)
+        ));
+        assert!(matches!(rx.unprotect_rtp(&second), Err(Error::SrtpReplay)));
+    }
+
+    #[test]
+    fn a_replayed_srtcp_packet_is_refused() {
+        let (mut tx, mut rx) = pair();
+        let mut rtcp = vec![0x80, 200];
+        rtcp.extend_from_slice(&6u16.to_be_bytes());
+        rtcp.extend_from_slice(&0xAABB_CCDDu32.to_be_bytes());
+        rtcp.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let packet = tx.protect_rtcp(&rtcp).unwrap();
+        assert!(rx.unprotect_rtcp(&packet).is_ok());
+        assert!(matches!(rx.unprotect_rtcp(&packet), Err(Error::SrtpReplay)));
+    }
+
+    /// RFC 3711 §3.1: the header, extension included, is authenticated but not
+    /// encrypted. Encrypting the extension garbles it for the far end.
+    #[test]
+    fn a_header_extension_is_authenticated_but_not_encrypted() {
+        let (mut tx, mut rx) = pair();
+        let mut rtp = vec![0x90, 0x00];
+        rtp.extend_from_slice(&5u16.to_be_bytes());
+        rtp.extend_from_slice(&800u32.to_be_bytes());
+        rtp.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        // One-byte header extension (RFC 8285), one 32-bit word.
+        rtp.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01, 0x10, 0x7F, 0x00, 0x00]);
+        rtp.extend_from_slice(&[0x55; 16]);
+        let protected = tx.protect_rtp(&rtp).unwrap();
+        assert_eq!(
+            &protected[..20],
+            &rtp[..20],
+            "header and extension stay clear"
+        );
+        assert_ne!(&protected[20..36], &rtp[20..36], "the payload is encrypted");
+        assert_eq!(rx.unprotect_rtp(&protected).unwrap(), rtp);
+
+        let mut tampered = protected;
+        tampered[17] ^= 0x01;
+        assert!(
+            rx.unprotect_rtp(&tampered).is_err(),
+            "the extension is authenticated"
+        );
     }
 
     #[test]

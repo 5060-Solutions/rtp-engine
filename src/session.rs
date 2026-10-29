@@ -1468,7 +1468,9 @@ fn run_audio_rx(
                                             decrypted
                                         }
                                         Err(e) => {
-                                            log::warn!("SRTP unprotect failed: {}", e);
+                                            // Debug: forged and replayed packets
+                                            // arrive at line rate.
+                                            log::debug!("SRTP unprotect failed: {}", e);
                                             continue;
                                         }
                                     },
