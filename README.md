@@ -19,7 +19,7 @@ Similar in scope to PJMEDIA, but designed from the ground up for Rust with moder
 
 ## Features
 
-- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, G.729A, Opus
+- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, Opus, and an 8 kbit/s codec on G.729's framing that is *not* ITU-T G.729 compatible
 - **RTP/RTCP**: Complete packet construction, parsing, and statistics per RFC 3550
 - **SRTP/SRTCP**: AES-CM-128-HMAC-SHA1-80 encryption per RFC 3711
 - **Jitter Buffer**: Adaptive and fixed modes with packet reordering and loss concealment

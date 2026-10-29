@@ -1,33 +1,24 @@
-//! G.729 Annex A codec implementation (dependency-free, pure Rust).
+//! An 8 kbit/s codec on G.729's framing (dependency-free, pure Rust).
 //!
-//! # Overview
+//! # Not ITU-T G.729 compatible
 //!
-//! G.729A is the reduced-complexity variant of G.729, and is by far the most
-//! widely deployed version in VoIP systems. It provides the same 8 kbps bitrate
-//! with imperceptible quality difference from the original G.729.
+//! This is **not** a conformant ITU-T G.729 / G.729 Annex A implementation and
+//! does not interoperate with real G.729 peers. It uses G.729's frame size
+//! (10 ms, 80 samples, 10 bytes) and payload type, but its bitstream is its
+//! own: the LSPs are coded as small deltas, the pitch lag directly, and there
+//! are no LSP, gain or algebraic codebooks. A real G.729 decoder fed its
+//! output, or it fed a real G.729 stream, produces noise.
 //!
-//! # Specifications
+//! Do not negotiate it with a peer that expects G.729. A conformant
+//! implementation, checked bit-exact against the ITU-T test vectors, is
+//! needed for that.
 //!
-//! - **Standard**: ITU-T G.729 Annex A (1996)
+//! # Framing
+//!
 //! - **Sample rate**: 8000 Hz
 //! - **Frame size**: 10ms (80 samples)
 //! - **Bitrate**: 8 kbps (10 bytes per frame)
 //! - **RTP payload type**: 18
-//! - **Algorithm**: CS-ACELP (Conjugate Structure Algebraic Code Excited Linear Prediction)
-//!
-//! # Why Annex A?
-//!
-//! - **Most compatible**: Virtually all VoIP systems support G.729A
-//! - **Lower CPU**: ~50% less computation than original G.729
-//! - **Same quality**: Imperceptible difference for speech
-//! - **Interoperable**: Fully compatible with G.729 decoders
-//!
-//! # Annex A Simplifications
-//!
-//! Compared to the original G.729, Annex A uses:
-//! - Simplified pitch prediction (reduced search range)
-//! - Simplified algebraic codebook search (focused search)
-//! - Simplified gain quantization (direct quantization)
 //!
 //! # Patent Status
 //!
