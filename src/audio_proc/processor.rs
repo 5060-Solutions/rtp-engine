@@ -73,6 +73,11 @@ pub struct VoiceProcessorConfig {
     pub noise_level: NoiseLevel,
     /// Bring a quiet or loud microphone toward a usable level.
     pub gain_control: bool,
+    /// With [`Self::gain_control`] on: `None` adapts the gain to the level,
+    /// `Some(db)` applies a fixed digital gain of `db` dB (0 to 90) with a
+    /// limiter. A fixed gain suits a phone line, whose level is already
+    /// normalised by the network and on which an adaptive gain audibly pumps.
+    pub fixed_gain_db: Option<u8>,
 }
 
 impl VoiceProcessorConfig {
@@ -85,6 +90,27 @@ impl VoiceProcessorConfig {
             noise_suppression: true,
             noise_level: NoiseLevel::Moderate,
             gain_control: true,
+            fixed_gain_db: None,
+        }
+    }
+
+    /// The sample rate [`Self::telephony_agent`] is meant to run at: wideband
+    /// speech, which is what speech recognition wants and what a narrowband
+    /// call resamples up to.
+    pub const TELEPHONY_RATE: u32 = 16_000;
+
+    /// The settings for a headless agent answering phone calls: cancel the
+    /// echo of its own speech coming back on the line (a speakerphone, or a
+    /// hybrid on an analogue leg), suppress noise moderately, and apply a
+    /// gentle fixed gain of 3 dB. Run it at [`Self::TELEPHONY_RATE`].
+    #[must_use]
+    pub fn telephony_agent() -> Self {
+        Self {
+            echo_cancellation: true,
+            noise_suppression: true,
+            noise_level: NoiseLevel::Moderate,
+            gain_control: true,
+            fixed_gain_db: Some(3),
         }
     }
 
@@ -101,7 +127,24 @@ const ALL_OFF: VoiceProcessorConfig = VoiceProcessorConfig {
     noise_suppression: false,
     noise_level: NoiseLevel::Moderate,
     gain_control: false,
+    fixed_gain_db: None,
 };
+
+/// The echo canceller's own measure of how it is doing.
+///
+/// Every field is `None` when processing is off or has not produced an
+/// estimate yet.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VoiceStats {
+    /// Echo return loss: how much quieter the echo is than the speaker signal,
+    /// in dB.
+    pub echo_return_loss_db: Option<f64>,
+    /// Echo return loss enhancement: how much the canceller removed from the
+    /// echo, in dB.
+    pub echo_return_loss_enhancement_db: Option<f64>,
+    /// The canceller's estimate of the speaker-to-microphone delay.
+    pub delay_ms: Option<u32>,
+}
 
 /// The configuration new sessions pick up when none is given.
 ///
@@ -261,6 +304,21 @@ impl VoiceProcessor {
         }
     }
 
+    /// The canceller's current echo statistics.
+    #[must_use]
+    pub fn stats(&self) -> VoiceStats {
+        #[cfg(feature = "audio-proc")]
+        if let State::Active { backend, .. } = &*self.read_state() {
+            let stats = backend.get_stats();
+            return VoiceStats {
+                echo_return_loss_db: stats.echo_return_loss,
+                echo_return_loss_enhancement_db: stats.echo_return_loss_enhancement,
+                delay_ms: stats.delay_ms,
+            };
+        }
+        VoiceStats::default()
+    }
+
     /// Take the microphone-side handle, reporting the capture device's rate.
     pub fn capture_path(self: &Arc<Self>, device_rate: u32) -> CapturePath {
         self.attach(Side::Capture, device_rate);
@@ -408,9 +466,17 @@ impl VoiceProcessor {
             // Digital-only. AdaptiveAnalog would require us to drive the OS
             // mixer's capture level, which this crate does not touch.
             gain_controller: config.gain_control.then(|| {
-                GainController::GainController1(GainController1 {
-                    mode: webrtc_audio_processing::config::GainControllerMode::AdaptiveDigital,
-                    ..GainController1::default()
+                GainController::GainController1(match config.fixed_gain_db {
+                    None => GainController1 {
+                        mode: webrtc_audio_processing::config::GainControllerMode::AdaptiveDigital,
+                        ..GainController1::default()
+                    },
+                    Some(db) => GainController1 {
+                        mode: webrtc_audio_processing::config::GainControllerMode::FixedDigital,
+                        compression_gain_db: db.min(90),
+                        enable_limiter: true,
+                        ..GainController1::default()
+                    },
                 })
             }),
             ..Config::default()
@@ -700,6 +766,7 @@ mod tests {
             noise_suppression: false,
             noise_level: NoiseLevel::Moderate,
             gain_control: false,
+            fixed_gain_db: None,
         });
         let mut capture = vp.capture_path(16_000);
         let mut render = vp.render_path(16_000);
@@ -767,5 +834,91 @@ mod tests {
             "a canceller with a silent reference has no echo to remove and \
              must leave near-end speech alone (in={energy_in:.4}, out={energy_out:.4})"
         );
+    }
+
+    /// The voice agent's preset: cancel the echo of its own speech, suppress
+    /// noise moderately, and apply a gentle fixed gain rather than an adaptive
+    /// one that would pump on a phone line's level changes.
+    #[test]
+    fn the_telephony_agent_preset() {
+        let config = VoiceProcessorConfig::telephony_agent();
+        assert!(config.echo_cancellation);
+        assert!(config.noise_suppression);
+        assert_eq!(config.noise_level, NoiseLevel::Moderate);
+        assert!(config.gain_control);
+        assert_eq!(config.fixed_gain_db, Some(3));
+        assert_eq!(VoiceProcessorConfig::TELEPHONY_RATE, 16_000);
+    }
+
+    #[test]
+    fn a_disabled_processor_reports_no_echo_statistics() {
+        let vp = VoiceProcessor::disabled();
+        assert_eq!(vp.stats(), super::VoiceStats::default());
+    }
+
+    /// Two calls in one process must not share canceller state: one call's
+    /// echo path adapting, or its audio, must not leak into the other.
+    /// Interleaves both calls frame by frame, as concurrent calls would be.
+    #[cfg(feature = "audio-proc")]
+    #[test]
+    fn two_processors_have_independent_state() {
+        let echo_only = VoiceProcessorConfig {
+            echo_cancellation: true,
+            noise_suppression: false,
+            noise_level: NoiseLevel::Moderate,
+            gain_control: false,
+            fixed_gain_db: None,
+        };
+        let a = VoiceProcessor::new(echo_only);
+        let b = VoiceProcessor::new(echo_only);
+        let (mut a_capture, mut a_render) = (a.capture_path(16_000), a.render_path(16_000));
+        let (mut b_capture, mut b_render) = (b.capture_path(16_000), b.render_path(16_000));
+        assert!(a.is_active() && b.is_active());
+
+        let frame = 160_usize;
+        let (mut phase_a, mut phase_b) = (0.0_f32, 0.0_f32);
+        let (mut a_in, mut a_out, mut b_in, mut b_out) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+        let energy = |s: &[f32]| s.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>();
+        // AEC3 needs a few hundred ms to converge, and on a pure tone drifts
+        // after a few seconds; measure the same window as `echo_energy`.
+        for n in 0..200 {
+            // Call A: the microphone hears only the echo of A's speaker.
+            let far: Vec<f32> = (0..frame)
+                .map(|_| {
+                    phase_a += 0.15;
+                    phase_a.sin() * 0.5
+                })
+                .collect();
+            let near_a: Vec<f32> = far.iter().map(|s| s * 0.5).collect();
+            a_render.analyze(&far);
+            let out_a = a_capture.process(&near_a).to_vec();
+
+            // Call B: a silent speaker and a talking caller, at a different
+            // pitch. If B shared A's state it would cancel B's caller as echo.
+            let near_b: Vec<f32> = (0..frame)
+                .map(|_| {
+                    phase_b += 0.11;
+                    phase_b.sin() * 0.25
+                })
+                .collect();
+            b_render.analyze(&vec![0.0; frame]);
+            let out_b = b_capture.process(&near_b).to_vec();
+
+            if n >= 150 {
+                a_in += energy(&near_a);
+                a_out += energy(&out_a);
+                b_in += energy(&near_b);
+                b_out += energy(&out_b);
+            }
+        }
+        assert!(
+            a_out < a_in * 0.5,
+            "A cancels its own echo (in={a_in:.3}, out={a_out:.3})"
+        );
+        assert!(
+            b_out > b_in * 0.7,
+            "B's caller survives (in={b_in:.3}, out={b_out:.3})"
+        );
+        assert!(a.stats().echo_return_loss_enhancement_db.is_some());
     }
 }

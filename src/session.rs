@@ -158,6 +158,32 @@ impl MediaSession {
             None,
             None,
             None,
+            crate::audio_proc::default_config(),
+        )
+        .await
+    }
+
+    /// Start a media session with its own voice processing configuration,
+    /// rather than the process-wide default from
+    /// [`crate::audio_proc::set_default_config`].
+    ///
+    /// For a process running several calls that must not share or reset each
+    /// other's echo canceller settings.
+    pub async fn start_with(
+        local_rtp_port: u16,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        voice: crate::audio_proc::VoiceProcessorConfig,
+    ) -> Result<Self> {
+        Self::start_internal(
+            local_rtp_port,
+            remote_addr,
+            codec_type,
+            None,
+            None,
+            None,
+            None,
+            voice,
         )
         .await
     }
@@ -181,6 +207,7 @@ impl MediaSession {
             None,
             input_device,
             output_device,
+            crate::audio_proc::default_config(),
         )
         .await
     }
@@ -204,6 +231,7 @@ impl MediaSession {
             None,
             None,
             None,
+            crate::audio_proc::default_config(),
         )
         .await
     }
@@ -229,6 +257,7 @@ impl MediaSession {
             Some(rx_srtp_ctx),
             None,
             None,
+            crate::audio_proc::default_config(),
         )
         .await
     }
@@ -252,6 +281,7 @@ impl MediaSession {
             Some(rx_srtp_ctx),
             input_device,
             output_device,
+            crate::audio_proc::default_config(),
         )
         .await
     }
@@ -264,6 +294,7 @@ impl MediaSession {
         #[allow(unused_variables)] rx_srtp_ctx: Option<SrtpContext>,
         #[allow(unused_variables)] input_device_name: Option<String>,
         #[allow(unused_variables)] output_device_name: Option<String>,
+        voice_config: crate::audio_proc::VoiceProcessorConfig,
     ) -> Result<Self> {
         let rtp_socket = UdpSocket::bind(format!("0.0.0.0:{}", local_rtp_port))
             .await
@@ -289,9 +320,9 @@ impl MediaSession {
 
         // One voice processor per session, shared by the capture and playback
         // threads — echo cancellation is only possible because both halves
-        // report to the same place. Snapshotted at session start so a settings
+        // report to the same place. Fixed at session start so a settings
         // change mid-call cannot reset the canceller's adapted state.
-        let voice = VoiceProcessor::from_default();
+        let voice = VoiceProcessor::new(voice_config);
 
         #[cfg(feature = "device")]
         let encoder = create_encoder(codec_type)?;
@@ -1842,6 +1873,26 @@ mod tests {
         // This tests error handling path
         if result.is_err() {
             assert!(matches!(result, Err(Error::Network(_))));
+        }
+    }
+
+    /// A session keeps the voice processing it was started with, whatever the
+    /// process-wide default says, so concurrent calls can differ.
+    #[tokio::test]
+    async fn a_session_uses_the_voice_config_it_was_started_with() {
+        use crate::audio_proc::VoiceProcessorConfig;
+        let port = MediaSession::allocate_port().await.unwrap();
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        let wanted = VoiceProcessorConfig::telephony_agent();
+        match MediaSession::start_with(port, remote, CodecType::Pcmu, wanted).await {
+            Ok(session) => {
+                assert_eq!(session.voice_processing_config(), wanted);
+                session.stop();
+            }
+            Err(e) => assert!(
+                matches!(e, Error::Device(_) | Error::Network(_)),
+                "unexpected error: {e:?}"
+            ),
         }
     }
 
