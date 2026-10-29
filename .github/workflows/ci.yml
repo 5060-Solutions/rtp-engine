@@ -15,6 +15,10 @@ env:
   # system package instead of building it.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
+# Least privilege: every job only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test
