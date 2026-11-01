@@ -103,7 +103,7 @@ pub(crate) fn safe_default_output_device(host: &cpal::Host) -> Option<cpal::Devi
 ///
 /// A failed enumeration counts as none: if the host cannot list its devices,
 /// asking it for a default is not going to go better.
-fn has_any<D>(devices: std::result::Result<D, cpal::DevicesError>) -> bool
+fn has_any<D>(devices: std::result::Result<D, cpal::Error>) -> bool
 where
     D: Iterator<Item = cpal::Device>,
 {
@@ -182,7 +182,7 @@ impl AudioCapture {
 
         let stream = device
             .build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if !cb_running.load(Ordering::Relaxed) {
                         return;
@@ -328,7 +328,7 @@ impl AudioPlayback {
 
         let stream = device
             .build_output_stream(
-                &stream_config,
+                stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     if let Ok(mut buf) = cb_buffer.lock() {
                         for sample in data.iter_mut() {
