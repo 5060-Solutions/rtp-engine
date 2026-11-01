@@ -169,7 +169,12 @@ impl JitterBuffer {
     ///
     /// Returns `true` if the packet was buffered, `false` if dropped.
     pub fn push(&mut self, seq: u16, timestamp: u32, payload: Vec<u8>) -> bool {
-        let now = Instant::now();
+        self.push_at(seq, timestamp, payload, Instant::now())
+    }
+
+    /// [`Self::push`] with the arrival time given rather than read from the
+    /// clock, for callers that own their clock (and for tests).
+    pub fn push_at(&mut self, seq: u16, timestamp: u32, payload: Vec<u8>, now: Instant) -> bool {
         self.stats.packets_received += 1;
 
         // Initialize base references on first packet
@@ -189,8 +194,21 @@ impl JitterBuffer {
         if let Some(playout) = self.playout_seq
             && extended_seq < playout
         {
-            self.stats.packets_dropped += 1;
-            return false;
+            if playout - extended_seq <= self.discontinuity() {
+                self.stats.packets_dropped += 1;
+                return false;
+            }
+            // Too far behind to be a late packet: the sender restarted its
+            // sequence. Start playout over from this packet, or every packet
+            // for the rest of the call would be dropped as late.
+            log::debug!(
+                "Jitter buffer: sequence jumped back by {}, restarting",
+                playout - extended_seq
+            );
+            self.packets.clear();
+            self.playout_seq = None;
+            self.playing = false;
+            self.base_time = Some(now);
         }
 
         // Check buffer capacity
@@ -220,10 +238,17 @@ impl JitterBuffer {
 
     /// Pop the next packet for playout, if ready.
     ///
-    /// Returns `None` if no packet is ready (still buffering or waiting for delay).
+    /// Returns `None` if no packet is ready: still buffering, waiting for the
+    /// delay, or nothing has arrived past the last packet played (a pause in
+    /// the stream, which is waited out rather than concealed). A missing
+    /// packet with later ones already buffered comes back as a synthesized,
+    /// empty packet for loss concealment.
     pub fn pop(&mut self) -> Option<BufferedPacket> {
-        let now = Instant::now();
+        self.pop_at(Instant::now())
+    }
 
+    /// [`Self::pop`] at a given time rather than now.
+    pub fn pop_at(&mut self, now: Instant) -> Option<BufferedPacket> {
         // Determine which sequence to play
         let target_seq = if let Some(seq) = self.playout_seq {
             seq
@@ -238,6 +263,24 @@ impl JitterBuffer {
             self.playing = true;
             first_seq
         };
+
+        // The packet to play is missing. With nothing buffered behind it the
+        // sender has paused (silence suppression) or the network stalled:
+        // wait rather than conceal, or playout runs ahead of the sender and
+        // the next talkspurt arrives "late". With the next packet far ahead,
+        // the sender jumped its sequence: skip to it rather than conceal
+        // every number in between.
+        let mut target_seq = target_seq;
+        if !self.packets.contains_key(&target_seq) {
+            let next = *self.packets.range(target_seq..).next()?.0;
+            if next - target_seq > self.discontinuity() {
+                log::debug!(
+                    "Jitter buffer: sequence jumped ahead by {}, resyncing",
+                    next - target_seq
+                );
+                target_seq = next;
+            }
+        }
 
         // Try to get the target packet
         let packet = if let Some(pkt) = self.packets.remove(&target_seq) {
@@ -341,6 +384,12 @@ impl JitterBuffer {
     }
 
     // --- Internal methods ---
+
+    /// The largest gap in sequence numbers treated as loss or lateness rather
+    /// than a sender restarting its sequence: a full buffer's worth.
+    fn discontinuity(&self) -> u32 {
+        self.config.max_packets.max(1) as u32
+    }
 
     fn extend_seq(&mut self, seq: u16) -> u32 {
         if let Some(last) = self.last_seq {
@@ -753,5 +802,132 @@ mod tests {
         assert_eq!(stats.packets_received, 3);
         assert_eq!(stats.packets_played, 4);
         assert_eq!(stats.packets_lost, 1);
+    }
+
+    /// A buffer driven by an explicit clock, for tests that need exact time.
+    fn clocked(target_ms: u32, min_ms: u32, max_ms: u32) -> (JitterBuffer, Instant) {
+        let config = JitterConfig {
+            mode: JitterMode::Adaptive {
+                target_ms,
+                min_ms,
+                max_ms,
+            },
+            clock_rate: 8000,
+            max_packets: 50,
+        };
+        (JitterBuffer::new(config), Instant::now())
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// With silence suppression (VAD/DTX) the sender stops for a while and
+    /// resumes with the next sequence number. That pause is not loss: if the
+    /// buffer conceals through it, playout runs ahead of the sender and the
+    /// whole next talkspurt is dropped as late.
+    #[test]
+    fn a_silence_gap_does_not_drop_the_talkspurt_after_it() {
+        let (mut jitter, t0) = clocked(40, 20, 120);
+        for seq in 0u16..5 {
+            jitter.push_at(
+                seq,
+                u32::from(seq) * 160,
+                vec![1],
+                t0 + ms(u64::from(seq) * 20),
+            );
+        }
+        let mut played = Vec::new();
+        for tick in 0..60u64 {
+            let now = t0 + ms(40 + tick * 20);
+            if tick == 30 {
+                // The talkspurt resumes after 600 ms of nothing.
+                for seq in 5u16..10 {
+                    jitter.push_at(seq, 20_000 + u32::from(seq) * 160, vec![2], now);
+                }
+            }
+            if let Some(packet) = jitter.pop_at(now)
+                && !packet.synthesized
+            {
+                played.push(packet.seq);
+            }
+        }
+        assert_eq!(played, (0u16..10).collect::<Vec<_>>());
+        assert_eq!(jitter.stats().packets_lost, 0, "a pause is not loss");
+    }
+
+    /// A sender that restarts its sequence far ahead must not make the buffer
+    /// conceal every number in between, which would be minutes of silence.
+    #[test]
+    fn a_large_forward_jump_resyncs_instead_of_concealing_the_gap() {
+        let (mut jitter, t0) = clocked(40, 20, 120);
+        jitter.push_at(0, 0, vec![1], t0);
+        jitter.push_at(1, 160, vec![1], t0 + ms(20));
+        assert_eq!(jitter.pop_at(t0 + ms(40)).map(|p| p.seq), Some(0));
+        assert_eq!(jitter.pop_at(t0 + ms(60)).map(|p| p.seq), Some(1));
+        jitter.push_at(20_000, 900_000, vec![3], t0 + ms(80));
+        let next = jitter.pop_at(t0 + ms(80)).unwrap();
+        assert_eq!(next.seq, 20_000);
+        assert!(!next.synthesized);
+    }
+
+    /// Likewise a jump backwards: without a restart every later packet is
+    /// "late" and dropped for the rest of the call.
+    #[test]
+    fn a_large_backward_jump_restarts_playout() {
+        let (mut jitter, t0) = clocked(40, 20, 120);
+        for seq in 5000u16..5005 {
+            jitter.push_at(seq, u32::from(seq) * 160, vec![1], t0);
+        }
+        for tick in 0..5u64 {
+            jitter.pop_at(t0 + ms(40 + tick * 20));
+        }
+        let later = t0 + ms(200);
+        for seq in 10u16..15 {
+            assert!(jitter.push_at(seq, u32::from(seq) * 160, vec![2], later));
+        }
+        let mut played = Vec::new();
+        for tick in 0..10u64 {
+            if let Some(packet) = jitter.pop_at(later + ms(40 + tick * 20)) {
+                played.push(packet.seq);
+            }
+        }
+        assert_eq!(played, (10u16..15).collect::<Vec<_>>());
+    }
+
+    /// Whatever arrives, the buffer never holds more than `max_packets`.
+    #[test]
+    fn memory_is_bounded_whatever_arrives() {
+        let (mut jitter, t0) = clocked(40, 20, 120);
+        let mut x = 0x9E37_79B9u32;
+        for n in 0..100_000u64 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            jitter.push_at((x >> 16) as u16, x, vec![0; 160], t0 + ms(n / 10));
+            if n % 7 == 0 {
+                jitter.pop_at(t0 + ms(n / 10));
+            }
+            assert!(jitter.len() <= 50);
+        }
+    }
+
+    /// The adaptive delay starts at the target and stays inside min..=max
+    /// however the arrival times swing.
+    #[test]
+    fn adaptive_delay_stays_within_its_bounds() {
+        let (mut jitter, t0) = clocked(40, 20, 120);
+        assert_eq!(jitter.delay_ms(), 40);
+        for seq in 0u16..500 {
+            let wobble = if seq % 2 == 0 { 0 } else { 300 };
+            let arrival = t0 + ms(u64::from(seq) * 20 + wobble);
+            jitter.push_at(seq, u32::from(seq) * 160, vec![1], arrival);
+            jitter.pop_at(arrival);
+            assert!(
+                (20..=120).contains(&jitter.delay_ms()),
+                "{}",
+                jitter.delay_ms()
+            );
+        }
     }
 }

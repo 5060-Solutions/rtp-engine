@@ -4,7 +4,7 @@
 //!
 //! This crate provides the building blocks for real-time audio communication:
 //!
-//! - **Codecs**: G.711 (μ-law/A-law) and Opus encoding/decoding
+//! - **Codecs**: G.711 (μ-law/A-law), G.722, G.729A and Opus encoding/decoding
 //! - **RTP/RTCP**: Packet construction, parsing, and statistics
 //! - **SRTP**: Secure RTP with AES-CM-128-HMAC-SHA1-80
 //! - **Audio devices**: Cross-platform capture and playback via cpal
@@ -46,6 +46,9 @@
 //! - `opus`: Opus codec support (requires libopus)
 //! - `srtp`: SRTP/SRTCP encryption
 //! - `device`: Audio device capture/playback via cpal
+//! - `audio-proc`: Echo cancellation and noise suppression (WebRTC APM)
+//! - `stream`: A headless per-call media stream ([`stream::MediaStream`]):
+//!   PCM frames in and out, no audio device, no threads
 
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
@@ -62,6 +65,9 @@ pub mod srtp;
 
 #[cfg(feature = "device")]
 pub mod device;
+
+#[cfg(feature = "stream")]
+pub mod stream;
 
 #[cfg(feature = "device")]
 pub use device::{

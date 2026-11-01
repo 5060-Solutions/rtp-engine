@@ -17,6 +17,6 @@ pub mod processor;
 
 pub use frame::{FRAME_MS, FrameAccumulator, frame_len};
 pub use processor::{
-    CapturePath, NoiseLevel, RenderPath, VoiceProcessor, VoiceProcessorConfig, default_config,
-    is_available, set_default_config,
+    CapturePath, NoiseLevel, RenderPath, VoiceProcessor, VoiceProcessorConfig, VoiceStats,
+    default_config, is_available, set_default_config,
 };

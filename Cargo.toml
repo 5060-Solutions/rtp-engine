@@ -84,7 +84,7 @@ used_underscore_binding = "allow"
 default = ["g711", "opus", "srtp", "device"]
 g711 = []
 opus = ["dep:audiopus"]
-srtp = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1"]
+srtp = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1", "dep:subtle"]
 device = ["dep:cpal"]
 # Acoustic echo cancellation and noise suppression for desktop capture.
 #
@@ -93,6 +93,10 @@ device = ["dep:cpal"]
 # must leave it off — Android and iOS already apply the platform's own echo
 # cancellation, and stacking a second one on top sounds worse than either.
 audio-proc = ["dep:webrtc-audio-processing"]
+# A headless per-call media stream (`stream::MediaStream`): PCM frames in and
+# out over a caller-supplied socket, on the caller's task, with no audio
+# device and no threads. For servers carrying many calls.
+stream = ["srtp"]
 
 [dependencies]
 # Core
@@ -125,6 +129,7 @@ aes = { version = "0.8", optional = true }
 ctr = { version = "0.9", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
+subtle = { version = "2.6", optional = true }
 base64 = "0.23"
 
 # Async runtime for device threads
@@ -133,6 +138,7 @@ tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "sy
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
 env_logger = "0.11"
+proptest = "1"
 
 # Upstream 2.1.0 does not build for windows-msvc and mis-detects the
 # architecture when cross-compiling for Apple targets. This only affects this
