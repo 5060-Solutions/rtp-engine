@@ -576,6 +576,13 @@ fn prf_aes_cm(master_key: &[u8], master_salt: &[u8], label: u8, output: &mut [u8
     let mut iv = [0u8; 16];
     iv[..14].copy_from_slice(&x);
 
+    let master_key: &[u8; 16] = master_key.try_into().map_err(|_| {
+        Error::srtp(format!(
+            "AES-CM master key must be 16 bytes, got {}",
+            master_key.len()
+        ))
+    })?;
+
     output.fill(0);
     let mut cipher = Aes128Ctr::new(master_key.into(), (&iv).into());
     cipher.apply_keystream(output);
