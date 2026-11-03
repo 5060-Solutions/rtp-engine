@@ -151,4 +151,4 @@ proptest = "1"
 # dependency on every run, and a cache hit can keep an old one long after the
 # branch moved.
 [patch.crates-io]
-webrtc-audio-processing-sys = { git = "https://github.com/5060-Solutions/webrtc-audio-processing.git", rev = "b3a2d7e" }
+webrtc-audio-processing-sys = { git = "https://github.com/5060-Solutions/webrtc-audio-processing.git", rev = "0bf9e50" }
