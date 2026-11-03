@@ -125,8 +125,8 @@ chrono = "0.4"
 audiopus = { version = "0.3.0-rc.0", optional = true }
 
 # SRTP (optional)
-aes = { version = "0.8", optional = true }
-ctr = { version = "0.9", optional = true }
+aes = { version = "0.9", optional = true }
+ctr = { version = "0.10", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
 subtle = { version = "2.6", optional = true }
