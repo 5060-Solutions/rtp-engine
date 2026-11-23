@@ -37,6 +37,20 @@ pub enum Encoded {
     NotSent,
 }
 
+/// The VAD's decisions for the previous two frames, which it feeds back
+/// into its next decision.
+struct VadHistory {
+    prev: bool,
+    prev2: bool,
+}
+
+impl VadHistory {
+    fn push(&mut self, vad: bool) {
+        self.prev2 = self.prev;
+        self.prev = vad;
+    }
+}
+
 pub struct Encoder {
     pre_process: PreProcess,
     old_speech: [i16; L_TOTAL],
@@ -55,8 +69,11 @@ pub struct Encoder {
     dtx: bool,
     vad: Vad,
     cng: CngEncoder,
-    past_vad: bool,
-    ppast_vad: bool,
+    vad_history: VadHistory,
+    /// Whether the last frame went out as speech. With DTX on from the
+    /// start this is the previous VAD decision; it differs only when DTX is switched on
+    /// mid-call, where the first silent frame must still open with a SID.
+    sent_speech: bool,
     seed: Random,
     frame: i16,
 }
@@ -80,11 +97,20 @@ impl Encoder {
             dtx,
             vad: Vad::new(),
             cng: CngEncoder::new(),
-            past_vad: true,
-            ppast_vad: true,
+            vad_history: VadHistory {
+                prev: true,
+                prev2: true,
+            },
+            sent_speech: true,
             seed: Random::with_seed(INIT_SEED),
             frame: 0,
         }
+    }
+
+    /// Turn DTX on or off from the next frame. The VAD and comfort-noise
+    /// state run either way, so switching needs no resynchronisation.
+    pub fn set_dtx(&mut self, dtx: bool) {
+        self.dtx = dtx;
     }
 
     /// Encode one 10 ms frame of 8 kHz PCM.
@@ -126,8 +152,8 @@ impl Encoder {
                 exp_r0,
                 sigpp: &self.old_speech,
                 frm_count: self.frame,
-                prev_marker: self.past_vad,
-                pprev_marker: self.ppast_vad,
+                prev_marker: self.vad_history.prev,
+                pprev_marker: self.vad_history.prev2,
             });
             self.cng.update(&rh_nbe, exp_r0, vad);
 
@@ -135,8 +161,8 @@ impl Encoder {
                 return self.encode_silence();
             }
             self.seed = Random::with_seed(INIT_SEED);
-            self.ppast_vad = self.past_vad;
-            self.past_vad = vad;
+            self.vad_history.push(vad);
+            self.sent_speech = true;
 
             self.lsp.quantize(&lsp_new, &mut lsp_new_q, &mut ana[..2]);
             int_qlpc(&self.lsp_old_q, &lsp_new_q, &mut aq_t);
@@ -304,7 +330,7 @@ impl Encoder {
         let frame = self.cng.encode(CngContext {
             exc: &mut self.old_exc,
             pos: EXC,
-            past_vad: self.past_vad,
+            past_vad: self.sent_speech,
             lsp_old_q: &mut self.lsp_old_q,
             aq: &mut aq_t,
             freq_prev: self.lsp.freq_prev_mut(),
@@ -312,8 +338,8 @@ impl Encoder {
             levinson: &mut self.levinson,
             taming: &mut self.taming,
         });
-        self.ppast_vad = self.past_vad;
-        self.past_vad = false;
+        self.vad_history.push(false);
+        self.sent_speech = false;
 
         for sf in 0..2 {
             let o = sf * L_SUBFR;

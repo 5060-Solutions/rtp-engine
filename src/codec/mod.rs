@@ -251,6 +251,14 @@ pub trait AudioEncoder: Send {
         });
     }
 
+    /// Turn discontinuous transmission on or off, for codecs that have it
+    /// (G.729 Annex B). Takes effect from the next frame. Returns whether
+    /// the codec supports DTX; the default does not and ignores the call.
+    fn set_dtx(&mut self, enabled: bool) -> bool {
+        let _ = enabled;
+        false
+    }
+
     /// Get the RTP payload type for this encoder.
     fn payload_type(&self) -> u8;
 

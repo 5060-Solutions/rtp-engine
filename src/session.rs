@@ -84,6 +84,8 @@ pub struct MediaSession {
     /// Disabled unless the host called `audio_proc::set_default_config` and the
     /// crate was built with the `audio-proc` feature.
     voice: Arc<VoiceProcessor>,
+    /// Discontinuous transmission, read by the TX thread before each packet.
+    dtx: Arc<AtomicBool>,
 }
 
 impl MediaSession {
@@ -303,6 +305,7 @@ impl MediaSession {
         let rtp_socket = Arc::new(rtp_socket);
         let muted = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        let dtx = Arc::new(AtomicBool::new(false));
         let ssrc: u32 = rand::random();
         let counters = RtpCounters::new(codec_type.name());
         let learned_remote: Arc<std::sync::Mutex<Option<SocketAddr>>> =
@@ -388,6 +391,7 @@ impl MediaSession {
             let tx_input_device = input_device_name.clone();
             let tx_level_ref = tx_level.clone();
             let tx_voice = voice.clone();
+            let tx_dtx = dtx.clone();
             std::thread::spawn(move || {
                 if let Err(e) = run_audio_tx(
                     tx_socket,
@@ -407,6 +411,7 @@ impl MediaSession {
                     tx_input_device,
                     tx_level_ref,
                     tx_voice,
+                    tx_dtx,
                 ) {
                     log::error!("Audio TX error: {}", e);
                 }
@@ -478,6 +483,7 @@ impl MediaSession {
         );
 
         Ok(Self {
+            dtx,
             muted,
             running,
             counters,
@@ -554,6 +560,17 @@ impl MediaSession {
     /// [`crate::codec::negotiate_codec_with_pt`].
     pub fn set_audio_payload_type(&self, pt: u8) {
         self.tx_payload_type.store(pt, Ordering::Relaxed);
+    }
+
+    /// Turn discontinuous transmission on or off, for codecs that have it
+    /// (G.729 Annex B). With it on, silence goes out as an occasional
+    /// 2-byte comfort-noise update instead of a packet every 20 ms, muted
+    /// keepalives included. Only for a peer that negotiated it
+    /// (`annexb=yes` for G.729). Takes effect from the next packet; returns
+    /// whether the session's codec supports DTX.
+    pub fn set_dtx(&self, enabled: bool) -> bool {
+        self.dtx.store(enabled, Ordering::Relaxed);
+        self.codec == CodecType::G729
     }
 
     /// Send an RFC 4733 DTMF digit as telephone-event packets.
@@ -894,6 +911,7 @@ fn run_audio_tx(
     input_device_name: Option<String>,
     tx_level: Arc<AtomicU32>,
     voice: Arc<VoiceProcessor>,
+    dtx: Arc<AtomicBool>,
 ) -> Result<()> {
     let host = crate::device::host();
     let device = match &input_device_name {
@@ -957,7 +975,10 @@ fn run_audio_tx(
     // not per codec frame — G.729's frame is 10 ms, and striding by that
     // while sending 20 ms packets ran its timestamp at half speed.
     let rtp_ts_stride = codec_type.rtp_ticks_per_packet();
-    let encoder = Arc::new(std::sync::Mutex::new(encoder));
+    let encoder = Arc::new(std::sync::Mutex::new(TxEncoder {
+        encoder,
+        audio_end: None,
+    }));
     let sample_buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(1024)));
     let samples_per_frame = codec_type.pcm_samples_per_packet();
     let native_samples_per_frame = ((samples_per_frame as f64) / resample_ratio).ceil() as usize;
@@ -986,6 +1007,7 @@ fn run_audio_tx(
     let cb_seq = seq.clone();
     let cb_ts = ts.clone();
     let cb_encoder = encoder.clone();
+    let cb_dtx = dtx.clone();
     let cb_socket = socket.clone();
     let cb_learned = learned_remote.clone();
     let cb_counters = counters.clone();
@@ -1070,16 +1092,15 @@ fn run_audio_tx(
                             }
                         }
 
-                        let current_seq = cb_seq.fetch_add(1, Ordering::Relaxed);
-                        let current_ts = cb_ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
                         let pt = cb_pt.load(Ordering::Relaxed);
-
-                        let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
-                        let mut packet = header.to_bytes();
-
-                        if let Ok(mut enc) = cb_encoder.lock() {
-                            enc.encode(&pcm, &mut packet);
-                        }
+                        let packets = match cb_encoder.lock() {
+                            Ok(mut tx) => {
+                                tx.encoder.set_dtx(cb_dtx.load(Ordering::Relaxed));
+                                tx.packets(&pcm, &cb_seq, &cb_ts, rtp_ts_stride, pt, ssrc)
+                            }
+                            Err(_) => continue,
+                        };
+                        for (current_seq, packet) in packets {
 
                         #[cfg(feature = "srtp")]
                         let send_packet = if let Some(ref srtp_ctx) = cb_srtp {
@@ -1128,6 +1149,7 @@ fn run_audio_tx(
                         cb_rt.spawn(async move {
                             let _ = socket.send_to(&send_packet, dest).await;
                         });
+                        }
                     }
                 }
             },
@@ -1156,6 +1178,7 @@ fn run_audio_tx(
     let keepalive_learned = learned_remote.clone();
     let keepalive_counters = counters.clone();
     let keepalive_encoder = encoder.clone();
+    let keepalive_dtx = dtx;
     #[cfg(feature = "srtp")]
     let keepalive_srtp = _srtp.clone();
 
@@ -1178,38 +1201,37 @@ fn run_audio_tx(
                     return;
                 }
 
-                let current_seq = seq.fetch_add(1, Ordering::Relaxed);
-                let current_ts = ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
                 let pt = payload_type.load(Ordering::Relaxed);
-
-                let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
-                let mut packet = header.to_bytes();
-
-                if let Ok(mut enc) = keepalive_encoder.lock() {
-                    enc.encode(&silence_pcm, &mut packet);
-                }
-
-                #[cfg(feature = "srtp")]
-                let send_packet = if let Some(ref srtp_ctx) = keepalive_srtp {
-                    match srtp_ctx.lock() {
-                        Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
-                        Err(_) => packet,
+                let packets = match keepalive_encoder.lock() {
+                    Ok(mut tx) => {
+                        tx.encoder.set_dtx(keepalive_dtx.load(Ordering::Relaxed));
+                        tx.packets(&silence_pcm, &seq, &ts, rtp_ts_stride, pt, ssrc)
                     }
-                } else {
-                    packet
+                    Err(_) => Vec::new(),
                 };
+                for (_, packet) in packets {
+                    #[cfg(feature = "srtp")]
+                    let send_packet = if let Some(ref srtp_ctx) = keepalive_srtp {
+                        match srtp_ctx.lock() {
+                            Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
+                            Err(_) => packet,
+                        }
+                    } else {
+                        packet
+                    };
 
-                #[cfg(not(feature = "srtp"))]
-                let send_packet = packet;
+                    #[cfg(not(feature = "srtp"))]
+                    let send_packet = packet;
 
-                keepalive_counters.record_sent(send_packet.len() as u64);
+                    keepalive_counters.record_sent(send_packet.len() as u64);
 
-                let dest = keepalive_learned
-                    .lock()
-                    .ok()
-                    .and_then(|g| *g)
-                    .unwrap_or(remote);
-                let _ = keepalive_socket.send_to(&send_packet, dest).await;
+                    let dest = keepalive_learned
+                        .lock()
+                        .ok()
+                        .and_then(|g| *g)
+                        .unwrap_or(remote);
+                    let _ = keepalive_socket.send_to(&send_packet, dest).await;
+                }
 
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -1229,38 +1251,37 @@ fn run_audio_tx(
                     continue;
                 }
 
-                let current_seq = seq.fetch_add(1, Ordering::Relaxed);
-                let current_ts = ts.fetch_add(rtp_ts_stride, Ordering::Relaxed);
                 let pt = payload_type.load(Ordering::Relaxed);
-
-                let header = RtpHeader::new(pt, current_seq, current_ts, ssrc);
-                let mut packet = header.to_bytes();
-
-                if let Ok(mut enc) = keepalive_encoder.lock() {
-                    enc.encode(&silence_pcm, &mut packet);
-                }
-
-                #[cfg(feature = "srtp")]
-                let send_packet = if let Some(ref srtp_ctx) = keepalive_srtp {
-                    match srtp_ctx.lock() {
-                        Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
-                        Err(_) => packet,
+                let packets = match keepalive_encoder.lock() {
+                    Ok(mut tx) => {
+                        tx.encoder.set_dtx(keepalive_dtx.load(Ordering::Relaxed));
+                        tx.packets(&silence_pcm, &seq, &ts, rtp_ts_stride, pt, ssrc)
                     }
-                } else {
-                    packet
+                    Err(_) => Vec::new(),
                 };
+                for (_, packet) in packets {
+                    #[cfg(feature = "srtp")]
+                    let send_packet = if let Some(ref srtp_ctx) = keepalive_srtp {
+                        match srtp_ctx.lock() {
+                            Ok(mut ctx) => ctx.protect_rtp(&packet).unwrap_or(packet),
+                            Err(_) => packet,
+                        }
+                    } else {
+                        packet
+                    };
 
-                #[cfg(not(feature = "srtp"))]
-                let send_packet = packet;
+                    #[cfg(not(feature = "srtp"))]
+                    let send_packet = packet;
 
-                keepalive_counters.record_sent(send_packet.len() as u64);
+                    keepalive_counters.record_sent(send_packet.len() as u64);
 
-                let dest = keepalive_learned
-                    .lock()
-                    .ok()
-                    .and_then(|g| *g)
-                    .unwrap_or(remote);
-                let _ = keepalive_socket.send_to(&send_packet, dest).await;
+                    let dest = keepalive_learned
+                        .lock()
+                        .ok()
+                        .and_then(|g| *g)
+                        .unwrap_or(remote);
+                    let _ = keepalive_socket.send_to(&send_packet, dest).await;
+                }
             }
         });
     });
@@ -1272,6 +1293,52 @@ fn run_audio_tx(
     drop(stream);
     drop(rt); // Shutdown the TX runtime after stream is done
     Ok(())
+}
+
+/// The session's encoder, shared by the microphone callback and the
+/// keepalive sender, with where its last audio packet ended.
+#[cfg(feature = "device")]
+struct TxEncoder {
+    encoder: Box<dyn AudioEncoder>,
+    /// The RTP timestamp just past the last audio packet sent. A packet that
+    /// does not start here follows a gap and starts a talkspurt.
+    audio_end: Option<u32>,
+}
+
+#[cfg(feature = "device")]
+impl TxEncoder {
+    /// Encode one packet's worth of `pcm` into plaintext RTP, numbered and
+    /// clocked from the shared counters: usually one packet; with DTX none
+    /// in silence, or two at a talkspurt boundary. The RTP clock advances
+    /// one packet's worth either way. Returns each packet's sequence number
+    /// and bytes.
+    fn packets(
+        &mut self,
+        pcm: &[i16],
+        seq: &AtomicU16,
+        ts: &AtomicU32,
+        stride: u32,
+        pt: u8,
+        ssrc: u32,
+    ) -> Vec<(u16, Vec<u8>)> {
+        let base = ts.fetch_add(stride, Ordering::Relaxed);
+        let mut encoded = Vec::with_capacity(1);
+        self.encoder.encode_packets(pcm, &mut encoded);
+        let mut out = Vec::with_capacity(encoded.len());
+        for p in encoded {
+            let t = base.wrapping_add(p.offset);
+            let s = seq.fetch_add(1, Ordering::Relaxed);
+            let mut header = RtpHeader::new(pt, s, t, ssrc);
+            if self.audio_end.is_some_and(|end| end != t) {
+                header = header.with_marker();
+            }
+            self.audio_end = Some(t.wrapping_add(p.duration));
+            let mut bytes = header.to_bytes();
+            bytes.extend_from_slice(&p.payload);
+            out.push((s, bytes));
+        }
+        out
+    }
 }
 
 /// Fill one playback buffer from the jitter-smoothed sample queue.
@@ -1989,5 +2056,75 @@ mod tests {
         let mut ctx_clone = SrtpContext::from_base64(&key).unwrap();
         let protected = ctx_clone.protect_rtp(&test_rtp);
         assert!(protected.is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "device"))]
+mod tx_encoder_tests {
+    use super::*;
+    use crate::codec::create_encoder_with_dtx;
+    use crate::rtp::RtpHeader;
+
+    fn tone(n: usize) -> Vec<i16> {
+        (0..160)
+            .map(|i| ((((n * 160 + i) as f64) * 0.35).sin() * 8000.0) as i16)
+            .collect()
+    }
+
+    fn run(dtx: bool, frames: &[Vec<i16>]) -> Vec<(usize, RtpHeader, usize)> {
+        let mut tx = TxEncoder {
+            encoder: create_encoder_with_dtx(CodecType::G729, dtx).unwrap(),
+            audio_end: None,
+        };
+        let (seq, ts) = (AtomicU16::new(7), AtomicU32::new(1000));
+        let mut sent = Vec::new();
+        for (n, pcm) in frames.iter().enumerate() {
+            for (s, bytes) in tx.packets(pcm, &seq, &ts, 160, 18, 42) {
+                let h = RtpHeader::parse(&bytes).unwrap();
+                assert_eq!(h.sequence, s);
+                sent.push((n, h, bytes.len() - 12));
+            }
+        }
+        assert_eq!(ts.load(Ordering::Relaxed), 1000 + 160 * frames.len() as u32);
+        sent
+    }
+
+    fn talk_pause_talk() -> Vec<Vec<i16>> {
+        (0..150)
+            .map(|n| {
+                if (40..110).contains(&n) {
+                    vec![0; 160]
+                } else {
+                    tone(n)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_dtx_every_packet_is_sent_unmarked() {
+        let sent = run(false, &talk_pause_talk());
+        assert_eq!(sent.len(), 150);
+        for (n, h, len) in &sent {
+            assert_eq!(
+                (h.timestamp, *len, h.marker),
+                (1000 + 160 * *n as u32, 20, false)
+            );
+        }
+    }
+
+    #[test]
+    fn with_dtx_a_pause_is_skipped_and_the_next_talkspurt_marked() {
+        let sent = run(true, &talk_pause_talk());
+        assert!(sent.len() < 100, "{} packets", sent.len());
+        for pair in sent.windows(2) {
+            assert_eq!(pair[1].1.sequence, pair[0].1.sequence.wrapping_add(1));
+        }
+        let resumed = sent
+            .iter()
+            .find(|(n, _, len)| *n >= 110 && *len == 20)
+            .unwrap();
+        assert!(resumed.1.marker);
+        assert_eq!(resumed.1.timestamp, 1000 + 160 * resumed.0 as u32);
     }
 }

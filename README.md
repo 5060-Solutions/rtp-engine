@@ -400,8 +400,9 @@ print a notice and skip, unless `G729_REQUIRE_VECTORS` is set, as CI sets it.
 
 G.729 here is Annex A with Annex B. Receiving needs nothing set: SID frames
 and DTX pauses play as comfort noise. Sending DTX is off by default, so the
-encoder's output suits any peer; set `StreamConfig::dtx` (or use
-`codec::create_encoder_with_dtx`) only when the peer negotiated `annexb=yes`,
+encoder's output suits any peer; set `StreamConfig::dtx`, call
+`MediaSession::set_dtx(true)`, or use `codec::create_encoder_with_dtx` only
+when the peer negotiated `annexb=yes`,
 which is the SDP default when the `annexb` parameter is absent.
 
 **Test coverage**: 137 unit tests + 4 doc tests covering:

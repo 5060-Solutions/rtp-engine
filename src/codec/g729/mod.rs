@@ -207,6 +207,11 @@ impl AudioEncoder for G729Encoder {
         packets.extend(open);
     }
 
+    fn set_dtx(&mut self, enabled: bool) -> bool {
+        self.inner.set_dtx(enabled);
+        true
+    }
+
     fn payload_type(&self) -> u8 {
         18
     }
@@ -507,6 +512,24 @@ mod api_tests {
         out.clear();
         dec.comfort_noise(160, &mut out);
         assert_eq!(out.len(), 160);
+    }
+
+    /// Switching DTX on during a pause still opens it with a SID, so the
+    /// far end gets comfort noise rather than concealing a "lost" packet.
+    #[test]
+    fn dtx_switched_on_mid_pause_opens_with_a_sid() {
+        let mut enc = G729Encoder::new();
+        let mut out = Vec::new();
+        enc.encode(&sine(FRAME_SAMPLES * 50), &mut out);
+        enc.encode(&vec![0i16; FRAME_SAMPLES * 50], &mut out);
+        assert!(enc.set_dtx(true));
+        out.clear();
+        enc.encode(&[0i16; FRAME_SAMPLES], &mut out);
+        assert_eq!(out.len(), SID_BYTES, "the first DTX frame is a SID");
+        assert!(enc.set_dtx(false));
+        out.clear();
+        enc.encode(&[0i16; FRAME_SAMPLES], &mut out);
+        assert_eq!(out.len(), FRAME_BYTES, "DTX off sends speech frames again");
     }
 
     #[test]
