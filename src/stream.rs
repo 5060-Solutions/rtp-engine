@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 
-use crate::codec::{AudioDecoder, AudioEncoder, CodecType, create_decoder, create_encoder};
+use crate::codec::{
+    AudioDecoder, AudioEncoder, CodecType, create_decoder, create_encoder_with_dtx,
+};
 use crate::error::{Error, Result};
 use crate::jitter::{JitterBuffer, JitterConfig, JitterMode, JitterStats};
 use crate::rtp::{RtpHeader, build_rtcp_sr};
@@ -78,6 +80,12 @@ pub struct StreamConfig {
     pub rtp_timeout: Duration,
     /// How many 20 ms packets one DTMF digit lasts.
     pub dtmf_packets: u16,
+    /// Discontinuous transmission, for codecs that have it (G.729 Annex B):
+    /// during silence send a comfort-noise update only when the noise
+    /// changes, and nothing otherwise. Off by default; only turn it on for
+    /// a peer that negotiated it (`annexb=yes` for G.729). Receiving a
+    /// DTX stream needs nothing set.
+    pub dtx: bool,
 }
 
 impl StreamConfig {
@@ -100,6 +108,7 @@ impl StreamConfig {
             max_packets: 50,
             rtp_timeout: Duration::from_secs(5),
             dtmf_packets: 5,
+            dtx: false,
         }
     }
 }
@@ -113,7 +122,9 @@ pub enum FrameKind {
     /// as silence.
     Concealed,
     /// Nothing to play: the sender paused (silence suppression) or the
-    /// network stalled. Zeros, so the frame clock keeps running.
+    /// network stalled. The codec's comfort noise when the sender paused
+    /// with one (G.729 Annex B), zeros otherwise, so the frame clock keeps
+    /// running.
     Silence,
 }
 
@@ -249,6 +260,9 @@ pub struct StreamCore {
     seq: u16,
     timestamp: u32,
     marker: bool,
+    /// The RTP timestamp just past the last audio packet sent. A packet
+    /// that does not start here follows a DTX gap and starts a talkspurt.
+    audio_end: Option<u32>,
     dtmf: VecDeque<u8>,
     dtmf_sending: Option<DtmfSend>,
 }
@@ -281,7 +295,7 @@ impl StreamCore {
             max_packets: config.max_packets,
         });
         Ok(Self {
-            encoder: create_encoder(config.codec)?,
+            encoder: create_encoder_with_dtx(config.codec, config.dtx)?,
             decoder: create_decoder(config.codec)?,
             jitter,
             srtp,
@@ -296,6 +310,7 @@ impl StreamCore {
             seq: rand::random(),
             timestamp: rand::random(),
             marker: true,
+            audio_end: None,
             dtmf: VecDeque::new(),
             dtmf_sending: None,
             config,
@@ -476,8 +491,11 @@ impl StreamCore {
             pcm.resize(samples, 0);
             events.push(StreamEvent::Frame(AudioFrame { pcm, kind }));
         } else if self.playing {
+            let mut pcm = Vec::with_capacity(samples);
+            self.decoder.comfort_noise(samples, &mut pcm);
+            pcm.resize(samples, 0);
             events.push(StreamEvent::Frame(AudioFrame {
-                pcm: vec![0; samples],
+                pcm,
                 kind: FrameKind::Silence,
             }));
         }
@@ -501,7 +519,8 @@ impl StreamCore {
     /// Build the datagrams for the next 20 ms: the audio `pcm` encoded, or,
     /// while a digit is being sent, its telephone-event packet instead (the
     /// last one three times, RFC 4733 §2.5.1.4). `pcm` must be exactly one
-    /// packet's worth at the codec's rate.
+    /// packet's worth at the codec's rate. With [`StreamConfig::dtx`] a
+    /// silent frame may produce no datagram, and a talkspurt boundary two.
     pub fn packetize(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
         let samples = self.config.codec.pcm_samples_per_packet();
         if pcm.len() != samples {
@@ -547,19 +566,21 @@ impl StreamCore {
             // Audio after the digit starts a new talkspurt.
             self.marker = true;
         } else {
-            let mut payload = Vec::with_capacity(samples);
-            self.encoder.encode(pcm, &mut payload);
-            let mut header = RtpHeader::new(
-                self.config.payload_type,
-                self.seq,
-                self.timestamp,
-                self.ssrc,
-            );
-            if self.marker {
-                header = header.with_marker();
-                self.marker = false;
+            // Usually one packet. With DTX: none in silence, or the audio
+            // split where the codec's packet format needs it.
+            let mut packets = Vec::with_capacity(1);
+            self.encoder.encode_packets(pcm, &mut packets);
+            for packet in packets {
+                let ts = self.timestamp.wrapping_add(packet.offset);
+                let mut header = RtpHeader::new(self.config.payload_type, self.seq, ts, self.ssrc);
+                let after_gap = self.audio_end.is_some_and(|end| end != ts);
+                if self.marker || after_gap {
+                    header = header.with_marker();
+                    self.marker = false;
+                }
+                datagrams.push(self.finish(header, &packet.payload)?);
+                self.audio_end = Some(ts.wrapping_add(packet.duration));
             }
-            datagrams.push(self.finish(header, &payload)?);
         }
         self.timestamp = self.timestamp.wrapping_add(ticks);
         Ok(datagrams)

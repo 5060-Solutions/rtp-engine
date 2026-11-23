@@ -19,7 +19,7 @@ Similar in scope to PJMEDIA, but designed from the ground up for Rust with moder
 
 ## Features
 
-- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, G.729 Annex A (pure Rust, bit-exact against the ITU-T test vectors), and Opus
+- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, G.729 Annex A with Annex B VAD/DTX/comfort noise (pure Rust, bit-exact against the ITU-T test vectors), and Opus
 - **RTP/RTCP**: Complete packet construction, parsing, and statistics per RFC 3550
 - **SRTP/SRTCP**: AES-CM-128-HMAC-SHA1-80 encryption per RFC 3711
 - **Jitter Buffer**: Adaptive and fixed modes with packet reordering and loss concealment
@@ -393,13 +393,16 @@ cargo test codec
 ```
 
 The G.729 tests check the codec bit for bit against the ITU-T G.729 Annex A
-test vectors. Those are ITU-T material and are not in this repository; fetch
+and Annex B test vectors. Those are ITU-T material and are not in this repository; fetch
 them once with `./scripts/fetch-g729-vectors.sh` (into `target/g729-vectors`,
 or wherever `G729_TEST_VECTORS` points). Without them the G.729 vector tests
 print a notice and skip, unless `G729_REQUIRE_VECTORS` is set, as CI sets it.
 
-G.729 here is Annex A without Annex B (no VAD/DTX/comfort noise), so offer it
-as `a=fmtp:18 annexb=no`.
+G.729 here is Annex A with Annex B. Receiving needs nothing set: SID frames
+and DTX pauses play as comfort noise. Sending DTX is off by default, so the
+encoder's output suits any peer; set `StreamConfig::dtx` (or use
+`codec::create_encoder_with_dtx`) only when the peer negotiated `annexb=yes`,
+which is the SDP default when the `annexb` parameter is absent.
 
 **Test coverage**: 137 unit tests + 4 doc tests covering:
 - Codec roundtrip accuracy

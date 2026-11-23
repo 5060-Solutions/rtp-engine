@@ -7,33 +7,32 @@ use super::basic_op::{
     norm_s, shl, shr, sub,
 };
 use super::lpc::{lsf_lsp2, lsp_lsf2};
-use super::tables::{FG, FG_SUM, FG_SUM_INV, LSPCB1, LSPCB2};
+use super::tables::{FG, FG_SUM, FG_SUM_INV, FREQ_PREV_RESET, LSPCB1, LSPCB2};
 use super::{M, NC};
 
-const MA_NP: usize = 4;
+pub const MA_NP: usize = 4;
 const MODE: usize = 2;
 const NC0_B: i16 = 7;
 const NC1_B: i16 = 5;
 const NC1: usize = 1 << NC1_B;
 
-const L_LIMIT: i16 = 40;
-const M_LIMIT: i16 = 25681;
+pub const L_LIMIT: i16 = 40;
+pub const M_LIMIT: i16 = 25681;
 const GAP1: i16 = 10;
 const GAP2: i16 = 5;
-const GAP3: i16 = 321;
+pub const GAP3: i16 = 321;
 const PI04: i16 = 1029;
 const PI92: i16 = 23677;
 const CONST10: i16 = 10 * (1 << 11);
 const CONST12: i16 = 19661;
 
-const FREQ_PREV_RESET: [i16; M] = [
-    2339, 4679, 7018, 9358, 11698, 14037, 16377, 18717, 21056, 23396,
-];
-
-type FreqPrev = [[i16; M]; MA_NP];
+/// The MA predictor's memory: the last four quantised LSF residuals.
+pub type FreqPrev = [[i16; M]; MA_NP];
+/// One MA predictor's coefficients.
+pub type MaPredictor = [[i16; M]; MA_NP];
 
 /// Push the codevector pairs in `buf[from..to]` at least `gap` apart.
-fn lsp_expand(buf: &mut [i16; M], gap: i16, from: usize, to: usize) {
+pub fn lsp_expand(buf: &mut [i16; M], gap: i16, from: usize, to: usize) {
     for j in from..to {
         let diff = sub(buf[j - 1], buf[j]);
         let tmp = shr(add(diff, gap), 1);
@@ -44,34 +43,46 @@ fn lsp_expand(buf: &mut [i16; M], gap: i16, from: usize, to: usize) {
     }
 }
 
-fn lsp_prev_compose(lsp_ele: &[i16; M], lsp: &mut [i16; M], mode: usize, freq_prev: &FreqPrev) {
+pub fn lsp_prev_compose(
+    lsp_ele: &[i16; M],
+    lsp: &mut [i16; M],
+    fg: &MaPredictor,
+    fg_sum: &[i16; M],
+    freq_prev: &FreqPrev,
+) {
     for j in 0..M {
-        let mut acc = l_mult(lsp_ele[j], FG_SUM[mode][j]);
+        let mut acc = l_mult(lsp_ele[j], fg_sum[j]);
         for k in 0..MA_NP {
-            acc = l_mac(acc, freq_prev[k][j], FG[mode][k][j]);
+            acc = l_mac(acc, freq_prev[k][j], fg[k][j]);
         }
         lsp[j] = extract_h(acc);
     }
 }
 
-fn lsp_prev_extract(lsp: &[i16; M], lsp_ele: &mut [i16; M], mode: usize, freq_prev: &FreqPrev) {
+pub fn lsp_prev_extract(
+    lsp: &[i16; M],
+    lsp_ele: &mut [i16; M],
+    fg: &MaPredictor,
+    fg_sum_inv: &[i16; M],
+    freq_prev: &FreqPrev,
+) {
     for j in 0..M {
         let mut t = l_deposit_h(lsp[j]);
         for k in 0..MA_NP {
-            t = l_msu(t, freq_prev[k][j], FG[mode][k][j]);
+            t = l_msu(t, freq_prev[k][j], fg[k][j]);
         }
         let temp = extract_h(t);
-        t = l_mult(temp, FG_SUM_INV[mode][j]);
+        t = l_mult(temp, fg_sum_inv[j]);
         lsp_ele[j] = extract_h(l_shl(t, 3));
     }
 }
 
-fn lsp_prev_update(lsp_ele: &[i16; M], freq_prev: &mut FreqPrev) {
+pub fn lsp_prev_update(lsp_ele: &[i16; M], freq_prev: &mut FreqPrev) {
     freq_prev.copy_within(0..MA_NP - 1, 1);
     freq_prev[0] = *lsp_ele;
 }
 
-fn lsp_stability(buf: &mut [i16; M]) {
+pub fn lsp_stability(buf: &mut [i16; M]) {
     for j in 0..M - 1 {
         if l_sub(l_deposit_l(buf[j + 1]), l_deposit_l(buf[j])) < 0 {
             buf.swap(j, j + 1);
@@ -108,13 +119,13 @@ fn lsp_get_quant(
     }
     lsp_expand(&mut buf, GAP1, 1, M);
     lsp_expand(&mut buf, GAP2, 1, M);
-    lsp_prev_compose(&buf, lspq, mode, freq_prev);
+    lsp_prev_compose(&buf, lspq, &FG[mode], &FG_SUM[mode], freq_prev);
     lsp_prev_update(&buf, freq_prev);
     lsp_stability(lspq);
 }
 
 /// Perceptual weights for the LSF error.
-fn get_wegt(flsp: &[i16; M], wegt: &mut [i16; M]) {
+pub fn get_wegt(flsp: &[i16; M], wegt: &mut [i16; M]) {
     let mut buf = [0i16; M];
     buf[0] = sub(flsp[1], PI04 + 8192);
     for i in 1..M - 1 {
@@ -215,6 +226,11 @@ impl LspEncoder {
         }
     }
 
+    /// The MA predictor memory, which Annex B's SID quantiser shares.
+    pub fn freq_prev_mut(&mut self) -> &mut FreqPrev {
+        &mut self.freq_prev
+    }
+
     /// Quantise `lsp` into `lsp_q`, writing the two LSP indices to `ana`.
     pub fn quantize(&mut self, lsp: &[i16; M], lsp_q: &mut [i16; M], ana: &mut [i16]) {
         let mut lsf = [0i16; M];
@@ -232,7 +248,13 @@ impl LspEncoder {
         let mut buf = [0i16; M];
 
         for mode in 0..MODE {
-            lsp_prev_extract(&lsf, &mut rbuf, mode, &self.freq_prev);
+            lsp_prev_extract(
+                &lsf,
+                &mut rbuf,
+                &FG[mode],
+                &FG_SUM_INV[mode],
+                &self.freq_prev,
+            );
             let c = lsp_pre_select(&rbuf);
             cand[mode] = c;
             let cb1 = &LSPCB1[c];
@@ -287,6 +309,11 @@ impl LspDecoder {
         }
     }
 
+    /// The MA predictor memory, which Annex B's SID decoder shares.
+    pub fn freq_prev_mut(&mut self) -> &mut FreqPrev {
+        &mut self.freq_prev
+    }
+
     /// Decode the two LSP indices into `lsp_q`; on an erased frame repeat
     /// the last LSFs.
     pub fn decode(&mut self, prm: &[i16], lsp_q: &mut [i16; M], erase: bool) {
@@ -294,7 +321,14 @@ impl LspDecoder {
         if erase {
             lsf_q = self.prev_lsp;
             let mut buf = [0i16; M];
-            lsp_prev_extract(&self.prev_lsp, &mut buf, self.prev_ma, &self.freq_prev);
+            let mode = self.prev_ma;
+            lsp_prev_extract(
+                &self.prev_lsp,
+                &mut buf,
+                &FG[mode],
+                &FG_SUM_INV[mode],
+                &self.freq_prev,
+            );
             lsp_prev_update(&buf, &mut self.freq_prev);
         } else {
             let mode = (shr(prm[0], NC0_B) & 1) as usize;

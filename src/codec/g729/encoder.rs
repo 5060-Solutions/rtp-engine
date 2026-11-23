@@ -1,14 +1,17 @@
-//! The G.729 Annex A encoder (CODER.C, COD_LD8A.C).
+//! The G.729 Annex A encoder, with Annex B's VAD and DTX (CODER.C,
+//! COD_LD8A.C).
 
 use super::acelp::acelp_code_a;
 use super::basic_op::{add, extract_h, l_mac, l_mult, l_shl, mult, negate, round, sub};
-use super::dsp::{PreProcess, residu, syn_filt};
+use super::dsp::{PreProcess, Random, residu, syn_filt};
+use super::dtx::{CngContext, CngEncoder, INIT_SEED};
 use super::gain::{GainQuantizer, corr_xy2};
-use super::lpc::{Levinson, autocorr, az_lsp, int_qlpc, lag_window, weight_az};
+use super::lpc::{Levinson, NP, autocorr, az_lsp, int_qlpc, lag_window, lsp_lsf, weight_az};
 use super::lsp::LspEncoder;
 use super::pitch::{
     EXC_HISTORY, Taming, enc_lag3, g_pitch, parity_pitch, pitch_fr3_fast, pitch_ol_fast,
 };
+use super::vad::{Vad, VadInput};
 use super::{
     GAMMA1, L_FRAME, L_NEXT, L_SUBFR, L_TOTAL, LSP_INIT, M, MP1, PIT_MAX, PIT_MIN, PRM_SIZE,
     SHARPMAX, SHARPMIN,
@@ -22,6 +25,17 @@ const NEW_SPEECH: usize = L_TOTAL - L_FRAME;
 const SPEECH: usize = NEW_SPEECH - L_NEXT;
 /// Start of the current frame in the excitation buffer.
 const EXC: usize = EXC_HISTORY;
+
+/// One encoded frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoded {
+    /// Active speech: the 11 parameters.
+    Speech([i16; PRM_SIZE]),
+    /// Annex B silence insertion descriptor: the 4 parameters.
+    Sid([i16; 4]),
+    /// Annex B: nothing to send for this frame.
+    NotSent,
+}
 
 pub struct Encoder {
     pre_process: PreProcess,
@@ -37,10 +51,18 @@ pub struct Encoder {
     lsp: LspEncoder,
     taming: Taming,
     gain: GainQuantizer,
+    /// Annex B: send SID frames and nothing during silence.
+    dtx: bool,
+    vad: Vad,
+    cng: CngEncoder,
+    past_vad: bool,
+    ppast_vad: bool,
+    seed: Random,
+    frame: i16,
 }
 
 impl Encoder {
-    pub const fn new() -> Self {
+    pub fn new(dtx: bool) -> Self {
         Self {
             pre_process: PreProcess::new(),
             old_speech: [0; L_TOTAL],
@@ -55,29 +77,67 @@ impl Encoder {
             lsp: LspEncoder::new(),
             taming: Taming::new(),
             gain: GainQuantizer::new(),
+            dtx,
+            vad: Vad::new(),
+            cng: CngEncoder::new(),
+            past_vad: true,
+            ppast_vad: true,
+            seed: Random::with_seed(INIT_SEED),
+            frame: 0,
         }
     }
 
-    /// Encode one 10 ms frame of 8 kHz PCM into its 11 parameters.
-    pub fn encode_frame(&mut self, pcm: &[i16]) -> [i16; PRM_SIZE] {
+    /// Encode one 10 ms frame of 8 kHz PCM.
+    pub fn encode_frame(&mut self, pcm: &[i16]) -> Encoded {
         let mut ana = [0i16; PRM_SIZE];
         let new = &mut self.old_speech[NEW_SPEECH..];
         new.copy_from_slice(&pcm[..L_FRAME]);
         self.pre_process.run(new);
+        self.frame = if self.frame == i16::MAX {
+            256
+        } else {
+            self.frame + 1
+        };
 
         // LP analysis, quantisation and interpolation.
         let mut aq_t = [0i16; 2 * MP1];
         let mut ap_t = [0i16; 2 * MP1];
         {
-            let mut r_h = [0i16; MP1];
-            let mut r_l = [0i16; MP1];
+            let mut r_h = [0i16; NP + 1];
+            let mut r_l = [0i16; NP + 1];
             let mut rc = [0i16; M];
             let mut lsp_new = [0i16; M];
             let mut lsp_new_q = [0i16; M];
-            autocorr(&self.old_speech, &mut r_h, &mut r_l);
+            let exp_r0 = autocorr(&self.old_speech, &mut r_h, &mut r_l);
+            let rh_nbe = r_h;
             lag_window(&mut r_h, &mut r_l);
-            self.levinson.run(&r_h, &r_l, &mut ap_t, &mut rc);
+            self.levinson.run(&r_h, &r_l, &mut ap_t, &mut rc, &mut 0);
             az_lsp(&ap_t, &mut lsp_new, &self.lsp_old);
+
+            // Annex B: voice activity, run whether or not DTX is on so its
+            // state always tracks the signal.
+            let mut lsf_new = [0i16; M];
+            lsp_lsf(&lsp_new, &mut lsf_new);
+            let vad = self.vad.detect(&VadInput {
+                rc: rc[1],
+                lsf: &lsf_new,
+                r_h: &r_h,
+                r_l: &r_l,
+                exp_r0,
+                sigpp: &self.old_speech,
+                frm_count: self.frame,
+                prev_marker: self.past_vad,
+                pprev_marker: self.ppast_vad,
+            });
+            self.cng.update(&rh_nbe, exp_r0, vad);
+
+            if !vad && self.dtx {
+                return self.encode_silence();
+            }
+            self.seed = Random::with_seed(INIT_SEED);
+            self.ppast_vad = self.past_vad;
+            self.past_vad = vad;
+
             self.lsp.quantize(&lsp_new, &mut lsp_new_q, &mut ana[..2]);
             int_qlpc(&self.lsp_old_q, &lsp_new_q, &mut aq_t);
             weight_az(&aq_t[..MP1], GAMMA1, &mut ap_t[..MP1]);
@@ -233,9 +293,62 @@ impl Encoder {
             }
         }
 
+        self.shift_buffers();
+        Encoded::Speech(ana)
+    }
+
+    /// Annex B: an inactive frame. Generates the comfort noise the decoder
+    /// will, so the filter memories stay in step with it.
+    fn encode_silence(&mut self) -> Encoded {
+        let mut aq_t = [0i16; 2 * MP1];
+        let frame = self.cng.encode(CngContext {
+            exc: &mut self.old_exc,
+            pos: EXC,
+            past_vad: self.past_vad,
+            lsp_old_q: &mut self.lsp_old_q,
+            aq: &mut aq_t,
+            freq_prev: self.lsp.freq_prev_mut(),
+            seed: &mut self.seed,
+            levinson: &mut self.levinson,
+            taming: &mut self.taming,
+        });
+        self.ppast_vad = self.past_vad;
+        self.past_vad = false;
+
+        for sf in 0..2 {
+            let o = sf * L_SUBFR;
+            let aq = &aq_t[sf * MP1..(sf + 1) * MP1];
+            let mut xn = [0i16; L_SUBFR];
+            residu(aq, &self.old_speech, SPEECH + o, &mut xn);
+            let mut ap = [0i16; MP1];
+            weight_az(aq, GAMMA1, &mut ap);
+            let mut ap1 = [0i16; MP1];
+            ap1[0] = 4096;
+            for i in 1..=M {
+                ap1[i] = sub(ap[i], mult(ap[i - 1], 22938));
+            }
+            syn_filt(
+                &ap1,
+                &xn,
+                &mut self.old_wsp[PIT_MAX + o..PIT_MAX + o + L_SUBFR],
+                &mut self.mem_w,
+                true,
+            );
+            for i in 0..L_SUBFR {
+                xn[i] = sub(xn[i], self.old_exc[EXC + o + i]);
+            }
+            let x = xn;
+            syn_filt(&ap, &x, &mut xn, &mut self.mem_w0, true);
+        }
+        self.sharp = SHARPMIN;
+        self.shift_buffers();
+
+        frame.map_or(Encoded::NotSent, Encoded::Sid)
+    }
+
+    fn shift_buffers(&mut self) {
         self.old_speech.copy_within(L_FRAME.., 0);
         self.old_wsp.copy_within(L_FRAME.., 0);
         self.old_exc.copy_within(L_FRAME.., 0);
-        ana
     }
 }

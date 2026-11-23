@@ -68,6 +68,10 @@ impl Random {
         Self(21845)
     }
 
+    pub const fn with_seed(seed: i16) -> Self {
+        Self(seed)
+    }
+
     pub fn draw(&mut self) -> i16 {
         self.0 = extract_l(l_add(l_shr(l_mult(self.0, 31821), 1), 13849));
         self.0

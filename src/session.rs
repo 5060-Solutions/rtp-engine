@@ -1576,9 +1576,9 @@ fn run_audio_rx(
 
                 // Playout timer: pop from jitter buffer every 20ms
                 _ = playout_interval.tick() => {
+                    let mut pcm = Vec::with_capacity(samples_per_packet);
                     if let Some(pkt) = jitter_buf.pop() {
                         // Decode the payload (empty payload = loss concealment)
-                        let mut pcm = Vec::with_capacity(samples_per_packet);
                         if pkt.payload.is_empty() {
                             // Packet loss. The codec conceals it: Opus
                             // rebuilds the frame from the FEC copy in the
@@ -1589,6 +1589,13 @@ fn run_audio_rx(
                         } else {
                             decoder.decode(&pkt.payload, &mut pcm);
                         }
+                    } else {
+                        // Nothing arrived. If the sender paused with comfort
+                        // noise (G.729 Annex B) the codec continues it; other
+                        // codecs produce nothing and the device plays silence.
+                        decoder.comfort_noise(samples_per_packet, &mut pcm);
+                    }
+                    if !pcm.is_empty() {
 
                         // Record RX audio if recording is active
                         if let Ok(handle) = recorder_handle.lock() {
