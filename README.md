@@ -19,7 +19,7 @@ Similar in scope to PJMEDIA, but designed from the ground up for Rust with moder
 
 ## Features
 
-- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, Opus, and an 8 kbit/s codec on G.729's framing that is *not* ITU-T G.729 compatible
+- **Audio Codecs**: G.711 μ-law (PCMU), G.711 A-law (PCMA), G.722, G.729 Annex A (pure Rust, bit-exact against the ITU-T test vectors), and Opus
 - **RTP/RTCP**: Complete packet construction, parsing, and statistics per RFC 3550
 - **SRTP/SRTCP**: AES-CM-128-HMAC-SHA1-80 encryption per RFC 3711
 - **Jitter Buffer**: Adaptive and fixed modes with packet reordering and loss concealment
@@ -349,7 +349,7 @@ sequenceDiagram
 
 | Module | Description |
 |--------|-------------|
-| `codec` | Audio encoder/decoder traits and implementations (G.711, Opus) |
+| `codec` | Audio encoder/decoder traits and implementations (G.711, G.722, G.729A, Opus) |
 | `rtp` | RTP/RTCP packet construction, parsing, and statistics |
 | `srtp` | SRTP encryption/decryption and SDP crypto attribute handling |
 | `jitter` | Adaptive and fixed jitter buffer with loss concealment |
@@ -391,6 +391,15 @@ cargo test jitter
 cargo test srtp
 cargo test codec
 ```
+
+The G.729 tests check the codec bit for bit against the ITU-T G.729 Annex A
+test vectors. Those are ITU-T material and are not in this repository; fetch
+them once with `./scripts/fetch-g729-vectors.sh` (into `target/g729-vectors`,
+or wherever `G729_TEST_VECTORS` points). Without them the G.729 vector tests
+print a notice and skip, unless `G729_REQUIRE_VECTORS` is set, as CI sets it.
+
+G.729 here is Annex A without Annex B (no VAD/DTX/comfort noise), so offer it
+as `a=fmtp:18 annexb=no`.
 
 **Test coverage**: 137 unit tests + 4 doc tests covering:
 - Codec roundtrip accuracy

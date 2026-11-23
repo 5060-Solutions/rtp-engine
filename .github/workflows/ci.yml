@@ -61,6 +61,19 @@ jobs:
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+      # The G.729 bit-exactness tests need the ITU-T test vectors, which are
+      # not in the repository. Locally they skip when absent; here
+      # G729_REQUIRE_VECTORS makes that a failure, so they always run.
+      - name: Cache G.729 test vectors
+        uses: actions/cache@v4
+        with:
+          path: .g729-vectors
+          key: g729-vectors-${{ hashFiles('scripts/fetch-g729-vectors.sh') }}
+      - name: Fetch G.729 test vectors
+        shell: bash
+        run: ./scripts/fetch-g729-vectors.sh
+        env:
+          G729_TEST_VECTORS: ${{ github.workspace }}/.g729-vectors
       # --all-features turns on audio-proc, so this actually runs the echo
       # canceller on every platform rather than only proving it links.
       #
@@ -71,9 +84,15 @@ jobs:
       - name: Run tests
         if: runner.os != 'Windows'
         run: cargo test --all-features
+        env:
+          G729_TEST_VECTORS: ${{ github.workspace }}/.g729-vectors
+          G729_REQUIRE_VECTORS: "1"
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
         run: cargo test --all-features -- --test-threads=1
+        env:
+          G729_TEST_VECTORS: ${{ github.workspace }}/.g729-vectors
+          G729_REQUIRE_VECTORS: "1"
 
       # A native fault gives an exit code and nothing else, which is close to
       # useless. cdb ships with the Windows SDK already on these runners, so on

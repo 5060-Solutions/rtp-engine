@@ -4,8 +4,8 @@
 //!
 //! - **G.711 μ-law (PCMU)**: PT 0, 8kHz, 64kbps, universal support
 //! - **G.711 A-law (PCMA)**: PT 8, 8kHz, 64kbps, common in Europe
-//! - **G.729 framing**: PT 18, 8kHz, 8kbps. Not ITU-T G.729 compatible; see
-//!   the `g729` module before negotiating it with any peer
+//! - **G.729 Annex A**: PT 18, 8kHz, 8kbps, bit-exact with the ITU-T reference;
+//!   no Annex B, so offer `annexb=no`
 //! - **G.722**: PT 9, 16kHz audio on an 8kHz RTP clock, 64kbps, wideband desk phones
 //! - **Opus**: PT 111, 48kHz, modern high-quality codec (feature-gated)
 //!
@@ -58,8 +58,9 @@ pub enum CodecType {
     Pcmu,
     /// G.711 A-law (PCMA) - RTP payload type 8, 64kbps
     Pcma,
-    /// G.729's framing and payload type 18, 8kbps. Not ITU-T G.729
-    /// compatible: do not negotiate it with a peer that expects G.729.
+    /// G.729 Annex A - RTP payload type 18, 8kbps. Interoperates with G.729
+    /// and G.729A peers; Annex B (DTX) is not implemented, so offer
+    /// `annexb=no`.
     G729,
     /// G.722 - RTP payload type 9, 64kbps, 16 kHz audio on an 8 kHz RTP clock
     G722,

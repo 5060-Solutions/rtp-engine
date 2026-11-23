@@ -14,3 +14,6 @@ Thumbs.db
 
 # Test artifacts
 *.profraw
+
+# ITU-T G.729 test vectors (scripts/fetch-g729-vectors.sh)
+/.g729-vectors
