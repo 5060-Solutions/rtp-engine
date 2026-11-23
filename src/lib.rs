@@ -4,7 +4,7 @@
 //!
 //! This crate provides the building blocks for real-time audio communication:
 //!
-//! - **Codecs**: G.711 (μ-law/A-law), G.722, G.729A and Opus encoding/decoding
+//! - **Codecs**: G.711 (μ-law/A-law), G.722, G.729 Annex A and Opus encoding/decoding
 //! - **RTP/RTCP**: Packet construction, parsing, and statistics
 //! - **SRTP**: Secure RTP with AES-CM-128-HMAC-SHA1-80
 //! - **Audio devices**: Cross-platform capture and playback via cpal
