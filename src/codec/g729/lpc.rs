@@ -5,17 +5,23 @@ use super::basic_op::{
     l_comp, l_extract, l_mac, l_msu, l_mult, l_negate, l_shl, l_shr, l_shr_r, l_sub, mpy_32,
     mpy_32_16, mult, mult_r, negate, norm_l, norm_s, overflow, round, shl, shr, sub,
 };
-use super::tables::{GRID, HAMWINDOW, LAG_H, LAG_L, SLOPE_ACOS, SLOPE_COS, TABLE2};
+use super::tables::{GRID, HAMWINDOW, LAG_H, LAG_L, SLOPE, SLOPE_ACOS, SLOPE_COS, TABLE, TABLE2};
 use super::{GRID_POINTS, L_WINDOW, M, MP1, NC};
 
-/// Windowed autocorrelation of `x` (`L_WINDOW` samples), as double
-/// precision `(r_h, r_l)`.
-pub fn autocorr(x: &[i16], r_h: &mut [i16; MP1], r_l: &mut [i16; MP1]) {
+/// Autocorrelation order: the LP filter's `M`, plus two more lags that
+/// Annex B's voice activity detector uses.
+pub const NP: usize = 12;
+
+/// Windowed autocorrelation of `x` (`L_WINDOW` samples) up to lag `NP`, as
+/// double precision `(r_h, r_l)`. Returns the exponent of `r[0]`, which
+/// Annex B needs to recover its absolute energy.
+pub fn autocorr(x: &[i16], r_h: &mut [i16; NP + 1], r_l: &mut [i16; NP + 1]) -> i16 {
     let mut y = [0i16; L_WINDOW];
     for i in 0..L_WINDOW {
         y[i] = mult_r(x[i], HAMWINDOW[i]);
     }
     let mut sum;
+    let mut exp_r0: i16 = 1;
     loop {
         clear_overflow();
         sum = 1;
@@ -28,11 +34,13 @@ pub fn autocorr(x: &[i16], r_h: &mut [i16; MP1], r_l: &mut [i16; MP1]) {
         for v in &mut y {
             *v = shr(*v, 2);
         }
+        exp_r0 = add(exp_r0, 4);
     }
     let norm = norm_l(sum);
+    exp_r0 = sub(exp_r0, norm);
     sum = l_shl(sum, norm);
     (r_h[0], r_l[0]) = l_extract(sum);
-    for i in 1..=M {
+    for i in 1..=NP {
         sum = 0;
         for j in 0..L_WINDOW - i {
             sum = l_mac(sum, y[j], y[j + i]);
@@ -40,10 +48,11 @@ pub fn autocorr(x: &[i16], r_h: &mut [i16; MP1], r_l: &mut [i16; MP1]) {
         sum = l_shl(sum, norm);
         (r_h[i], r_l[i]) = l_extract(sum);
     }
+    exp_r0
 }
 
-pub fn lag_window(r_h: &mut [i16; MP1], r_l: &mut [i16; MP1]) {
-    for i in 1..=M {
+pub fn lag_window(r_h: &mut [i16; NP + 1], r_l: &mut [i16; NP + 1]) {
+    for i in 1..=NP {
         let x = mpy_32(r_h[i], r_l[i], LAG_H[i - 1], LAG_L[i - 1]);
         (r_h[i], r_l[i]) = l_extract(x);
     }
@@ -66,7 +75,10 @@ impl Levinson {
         }
     }
 
-    pub fn run(&mut self, rh: &[i16; MP1], rl: &[i16; MP1], a: &mut [i16], rc: &mut [i16; M]) {
+    /// Solve for the LP filter `a` (Q12) from autocorrelations `rh`/`rl`
+    /// (the first `MP1` entries). `err` takes the prediction error energy,
+    /// and is left alone if the filter came out unstable.
+    pub fn run(&mut self, rh: &[i16], rl: &[i16], a: &mut [i16], rc: &mut [i16; M], err: &mut i16) {
         let mut ah = [0i16; MP1];
         let mut al = [0i16; MP1];
         let mut anh = [0i16; MP1];
@@ -146,6 +158,7 @@ impl Levinson {
             self.old_a[i] = a[i];
         }
         self.old_rc = [rc[0], rc[1]];
+        *err = shr(alp_h, alp_exp);
     }
 }
 
@@ -317,6 +330,19 @@ pub fn lsp_az(lsp: &[i16], a: &mut [i16]) {
         a[i] = extract_l(l_shr_r(l_add(f1[i], f2[i]), 13));
         a[j] = extract_l(l_shr_r(l_sub(f1[i], f2[i]), 13));
         j -= 1;
+    }
+}
+
+/// LSP (Q15) to normalised LSF (Q15, `0..0.5`).
+pub fn lsp_lsf(lsp: &[i16], lsf: &mut [i16]) {
+    let mut ind: usize = 63;
+    for i in (0..M).rev() {
+        while sub(TABLE[ind], lsp[i]) < 0 {
+            ind -= 1;
+        }
+        let t = l_mult(sub(lsp[i], TABLE[ind]), SLOPE[ind]);
+        let tmp = round(l_shl(t, 3));
+        lsf[i] = add(tmp, shl(ind as i16, 8));
     }
 }
 

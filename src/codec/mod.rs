@@ -4,8 +4,8 @@
 //!
 //! - **G.711 μ-law (PCMU)**: PT 0, 8kHz, 64kbps, universal support
 //! - **G.711 A-law (PCMA)**: PT 8, 8kHz, 64kbps, common in Europe
-//! - **G.729 Annex A**: PT 18, 8kHz, 8kbps, bit-exact with the ITU-T reference;
-//!   no Annex B, so offer `annexb=no`
+//! - **G.729 Annex A + B**: PT 18, 8kHz, 8kbps, bit-exact with the ITU-T
+//!   reference; decodes Annex B comfort noise always, sends DTX on request
 //! - **G.722**: PT 9, 16kHz audio on an 8kHz RTP clock, 64kbps, wideband desk phones
 //! - **Opus**: PT 111, 48kHz, modern high-quality codec (feature-gated)
 //!
@@ -59,8 +59,9 @@ pub enum CodecType {
     /// G.711 A-law (PCMA) - RTP payload type 8, 64kbps
     Pcma,
     /// G.729 Annex A - RTP payload type 18, 8kbps. Interoperates with G.729
-    /// and G.729A peers; Annex B (DTX) is not implemented, so offer
-    /// `annexb=no`.
+    /// and G.729A peers, and decodes Annex B (SID frames and comfort noise).
+    /// The encoder sends DTX only when asked
+    /// ([`create_encoder_with_dtx`], `StreamConfig::dtx`).
     G729,
     /// G.722 - RTP payload type 9, 64kbps, 16 kHz audio on an 8 kHz RTP clock
     G722,
@@ -232,11 +233,50 @@ pub trait AudioEncoder: Send {
     /// Number of samples consumed from input.
     fn encode(&mut self, pcm: &[i16], output: &mut Vec<u8>) -> usize;
 
+    /// Encode `pcm` into the RTP packets to send for it.
+    ///
+    /// Most codecs produce one packet holding all of `pcm`, which is what
+    /// the default does. A codec with discontinuous transmission (G.729
+    /// Annex B) may produce none during silence, or split the audio where
+    /// its packet format requires; each packet says where it starts.
+    fn encode_packets(&mut self, pcm: &[i16], packets: &mut Vec<EncodedPacket>) {
+        let mut payload = Vec::new();
+        let consumed = self.encode(pcm, &mut payload);
+        let codec = self.codec_type();
+        let ticks = consumed as u64 * u64::from(codec.clock_rate()) / u64::from(codec.pcm_rate());
+        packets.push(EncodedPacket {
+            offset: 0,
+            duration: ticks as u32,
+            payload,
+        });
+    }
+
+    /// Turn discontinuous transmission on or off, for codecs that have it
+    /// (G.729 Annex B). Takes effect from the next frame. Returns whether
+    /// the codec supports DTX; the default does not and ignores the call.
+    fn set_dtx(&mut self, enabled: bool) -> bool {
+        let _ = enabled;
+        false
+    }
+
     /// Get the RTP payload type for this encoder.
     fn payload_type(&self) -> u8;
 
     /// Get the codec type.
     fn codec_type(&self) -> CodecType;
+}
+
+/// One RTP packet's worth of encoded audio, from
+/// [`AudioEncoder::encode_packets`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedPacket {
+    /// Where the packet starts, in RTP timestamp ticks from the start of
+    /// the PCM it was encoded from.
+    pub offset: u32,
+    /// How much audio it covers, in RTP timestamp ticks.
+    pub duration: u32,
+    /// The RTP payload.
+    pub payload: Vec<u8>,
 }
 
 /// Trait for audio decoders.
@@ -260,6 +300,17 @@ pub trait AudioDecoder: Send {
         output.extend(std::iter::repeat_n(0i16, samples));
     }
 
+    /// Produce up to `samples` PCM samples for a stretch where the sender
+    /// sent nothing at all (silence suppression), as opposed to packets
+    /// that went missing.
+    ///
+    /// A codec with comfort noise (G.729 Annex B) continues the noise its
+    /// last SID frame described. The default appends nothing, leaving the
+    /// caller to play silence.
+    fn comfort_noise(&mut self, samples: usize, output: &mut Vec<i16>) {
+        let _ = (samples, output);
+    }
+
     /// Get the codec type.
     fn codec_type(&self) -> CodecType;
 }
@@ -273,6 +324,16 @@ pub fn create_encoder(codec: CodecType) -> Result<Box<dyn AudioEncoder>> {
         CodecType::G722 => Ok(Box::new(G722Encoder::new())),
         #[cfg(feature = "opus")]
         CodecType::Opus => Ok(Box::new(OpusEncoder::new()?)),
+    }
+}
+
+/// Create an encoder for `codec`, with discontinuous transmission when
+/// `dtx` is set and the codec supports it (G.729 Annex B; only for a peer
+/// that negotiated `annexb=yes`). Other codecs ignore `dtx`.
+pub fn create_encoder_with_dtx(codec: CodecType, dtx: bool) -> Result<Box<dyn AudioEncoder>> {
+    match codec {
+        CodecType::G729 if dtx => Ok(Box::new(G729Encoder::with_dtx())),
+        _ => create_encoder(codec),
     }
 }
 

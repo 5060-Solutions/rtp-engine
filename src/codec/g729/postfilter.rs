@@ -44,8 +44,15 @@ impl PostFilter {
     }
 
     /// Postfilter one frame of synthesis in place, given both subframes'
-    /// LP filters and pitch lags.
-    pub fn run(&mut self, syn: &mut [i16; L_FRAME], az_4: &[i16; 2 * MP1], t: [i16; 2]) {
+    /// LP filters and pitch lags. Comfort noise (`speech == false`) skips
+    /// the pitch postfilter.
+    pub fn run(
+        &mut self,
+        syn: &mut [i16; L_FRAME],
+        az_4: &[i16; 2 * MP1],
+        t: [i16; 2],
+        speech: bool,
+    ) {
         let mut buf = [0i16; M + L_FRAME];
         buf[..M].copy_from_slice(&self.syn_hist);
         buf[M..].copy_from_slice(syn);
@@ -72,7 +79,11 @@ impl PostFilter {
                 self.scal_res2[PIT_MAX + j] = shr(self.res2[PIT_MAX + j], 2);
             }
 
-            self.pit_pst_filt(t0_min, t0_max, &mut res2_pst);
+            if speech {
+                self.pit_pst_filt(t0_min, t0_max, &mut res2_pst);
+            } else {
+                res2_pst.copy_from_slice(&self.res2[PIT_MAX..]);
+            }
 
             // Tilt of the formant postfilter's impulse response.
             let mut h_in = [0i16; L_H];

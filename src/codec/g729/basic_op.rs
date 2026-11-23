@@ -93,6 +93,19 @@ pub fn shr(a: i16, n: i16) -> i16 {
     }
 }
 
+/// Shift right with rounding.
+#[inline]
+pub fn shr_r(a: i16, n: i16) -> i16 {
+    if n > 15 {
+        return 0;
+    }
+    let mut out = shr(a, n);
+    if n > 0 && (a & (1 << (n - 1))) != 0 {
+        out = out.wrapping_add(1);
+    }
+    out
+}
+
 #[inline]
 pub fn mult(a: i16, b: i16) -> i16 {
     let p = (i32::from(a) * i32::from(b)) >> 15;
@@ -330,6 +343,10 @@ mod tests {
         assert_eq!(shl(-0x4000, 1), MIN_16);
         assert_eq!(shl(3, -1), 1);
         assert_eq!(l_shr_r(3, 1), 2);
+        assert_eq!(shr_r(3, 1), 2);
+        assert_eq!(shr_r(-3, 1), -1);
+        assert_eq!(shr_r(5, 0), 5);
+        assert_eq!(shr_r(5, 16), 0);
         assert_eq!(l_shr(-1, 40), -1);
     }
 

@@ -437,13 +437,145 @@ fn packetize_numbers_and_clocks_the_stream() {
     assert!(core.packetize(&[0; 100]).is_err(), "a frame must be 20 ms");
 }
 
+/// A low background hiss: what DTX's comfort noise models.
+fn hiss(samples: usize, seed: &mut u32) -> Vec<i16> {
+    (0..samples)
+        .map(|_| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 17;
+            *seed ^= *seed << 5;
+            (*seed % 400) as i16 - 200
+        })
+        .collect()
+}
+
+/// Talk, pause, talk: 1 s of tone, 2 s of hiss, 1 s of tone, 20 ms at a
+/// time.
+fn talk_pause_talk() -> Vec<Vec<i16>> {
+    let mut seed = 1;
+    let mut frames = Vec::new();
+    for n in 0..200 {
+        frames.push(if (50..150).contains(&n) {
+            hiss(160, &mut seed)
+        } else {
+            tone(160, 8000, 440.0, n * 160)
+        });
+    }
+    frames
+}
+
+/// G.729 with DTX goes quiet in a pause: a SID or nothing instead of 20
+/// bytes every 20 ms. The RTP clock keeps running through the gap and the
+/// next talkspurt is marked, its sequence carrying straight on.
+#[test]
+fn g729_dtx_sends_nothing_in_a_pause() {
+    let mut config = StreamConfig::new(CodecType::G729, PEER);
+    config.dtx = true;
+    let mut core = StreamCore::new(config, None).unwrap();
+    let mut sent = Vec::new();
+    for (n, frame) in talk_pause_talk().iter().enumerate() {
+        for d in core.packetize(frame).unwrap() {
+            sent.push((n, RtpHeader::parse(&d).unwrap(), d.len() - 12));
+        }
+    }
+    // The VAD holds speech for a few hundred ms into the pause while it
+    // settles on the noise floor; past that, DTX.
+    let in_pause = |n: usize| (70..150).contains(&n);
+    let pause: Vec<_> = sent.iter().filter(|(n, ..)| in_pause(*n)).collect();
+    assert!(
+        pause.len() < 20,
+        "{} packets in 1.6 s of pause",
+        pause.len()
+    );
+    assert!(
+        pause.iter().all(|(_, _, len)| *len == 2),
+        "only SIDs in a pause: {:?}",
+        pause.iter().map(|(n, _, l)| (*n, *l)).collect::<Vec<_>>()
+    );
+
+    let (first_n, first, _) = &sent[0];
+    for pair in sent.windows(2) {
+        assert_eq!(pair[1].1.sequence, pair[0].1.sequence.wrapping_add(1));
+    }
+    let resumed = sent
+        .iter()
+        .find(|(n, _, len)| *n >= 150 && *len >= 10)
+        .unwrap();
+    assert!(resumed.1.marker, "a talkspurt after DTX is marked");
+    let (first_n, elapsed) = (*first_n, resumed.1.timestamp.wrapping_sub(first.timestamp));
+    assert!(
+        elapsed == (resumed.0 - first_n) as u32 * 160
+            || elapsed == (resumed.0 - first_n) as u32 * 160 + 80,
+        "RTP clock ran through the pause: {elapsed}"
+    );
+    assert!(
+        sent.iter()
+            .filter(|(n, ..)| *n < 50)
+            .all(|(_, _, len)| *len == 20)
+    );
+}
+
+/// A DTX sender's pause plays out as its comfort noise, not as zeros, and
+/// speech after it decodes normally.
+#[test]
+fn g729_dtx_pause_plays_comfort_noise() {
+    let mut a_config = StreamConfig::new(CodecType::G729, PEER);
+    a_config.dtx = true;
+    let mut a = StreamCore::new(a_config, None).unwrap();
+    let mut b = StreamCore::new(StreamConfig::new(CodecType::G729, PEER), None).unwrap();
+
+    let t0 = Instant::now();
+    let mut played = Vec::new();
+    for (n, frame) in talk_pause_talk().iter().enumerate() {
+        let now = t0 + Duration::from_millis(20 * n as u64);
+        for d in a.packetize(frame).unwrap() {
+            b.ingest(&d, PEER, now).unwrap();
+        }
+        for e in b.playout(now) {
+            if let StreamEvent::Frame(f) = e {
+                played.push((n, f));
+            }
+        }
+    }
+    let rms = |pcm: &[i16]| {
+        (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+    };
+    let pause: Vec<_> = played
+        .iter()
+        .filter(|(n, _)| (80..140).contains(n))
+        .collect();
+    assert!(
+        pause.iter().any(|(_, f)| f.kind == FrameKind::Silence),
+        "the pause is a pause"
+    );
+    assert!(
+        pause.iter().all(|(_, f)| rms(&f.pcm) > 10.0),
+        "comfort noise, not zeros: {:?}",
+        pause
+            .iter()
+            .map(|(_, f)| rms(&f.pcm) as i32)
+            .collect::<Vec<_>>()
+    );
+    let after: Vec<_> = played.iter().filter(|(n, _)| *n >= 170).collect();
+    assert!(
+        after
+            .iter()
+            .all(|(_, f)| f.kind == FrameKind::Received && rms(&f.pcm) > 1000.0)
+    );
+}
+
 mod fuzz {
     use super::*;
     use proptest::prelude::*;
 
     /// The codecs the fuzzers drive: every decoder sees arbitrary payloads.
     fn codecs() -> Vec<CodecType> {
-        let mut codecs = vec![CodecType::Pcmu, CodecType::Pcma, CodecType::G722];
+        let mut codecs = vec![
+            CodecType::Pcmu,
+            CodecType::Pcma,
+            CodecType::G722,
+            CodecType::G729,
+        ];
         #[cfg(feature = "opus")]
         codecs.push(CodecType::Opus);
         codecs
