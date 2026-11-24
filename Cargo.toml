@@ -83,7 +83,7 @@ used_underscore_binding = "allow"
 [features]
 default = ["g711", "opus", "srtp", "device"]
 g711 = []
-opus = ["dep:audiopus"]
+opus = ["dep:opusic-c"]
 srtp = ["dep:aes", "dep:ctr", "dep:hmac", "dep:sha1", "dep:subtle"]
 device = ["dep:cpal"]
 # Acoustic echo cancellation and noise suppression for desktop capture.
@@ -122,7 +122,8 @@ chrono = "0.4"
 
 
 # Opus codec (optional)
-audiopus = { version = "0.3.0-rc.0", optional = true }
+# libopus 1.6, built from source on every platform (see codec/opus_codec.rs).
+opusic-c = { version = "1.6.1", optional = true }
 
 # SRTP (optional)
 aes = { version = "0.9", optional = true }

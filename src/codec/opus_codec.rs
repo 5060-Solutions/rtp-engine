@@ -8,6 +8,11 @@
 //! The encoder is tuned for VoIP: a fixed 32 kbit/s bitrate and in-band FEC,
 //! which puts a low-rate copy of each frame into the following packet so a
 //! single lost packet can be reconstructed by [`OpusDecoder::conceal_loss`].
+//!
+//! libopus is `opusic-c` / `opusic-sys`, which build the reference library
+//! (1.6) from source on every platform. It was `audiopus`, whose bundled copy
+//! predated what CMake 4 will configure and which linked whatever system
+//! libopus a platform had where one was installed.
 
 use super::{AudioDecoder, AudioEncoder, CodecType};
 use crate::error::{Error, Result};
@@ -17,7 +22,7 @@ const OPUS_RATE: u32 = 48_000;
 
 /// Encoder bitrate. 32 kbit/s is comfortably transparent for mono speech at
 /// full band and leaves room for the FEC copy.
-const BITRATE_BPS: i32 = 32_000;
+const BITRATE_BPS: u32 = 32_000;
 
 /// The loss the encoder plans for. libopus only emits FEC data when it is
 /// told to expect some loss; 10 % is enough to turn it on without the
@@ -30,33 +35,45 @@ const MAX_DECODED_SAMPLES: usize = 5760;
 /// Frame lengths libopus accepts at 48 kHz: 2.5, 5, 10, 20, 40 and 60 ms.
 const VALID_FRAME_LENGTHS: [usize; 6] = [120, 240, 480, 960, 1920, 2880];
 
+/// opusic-c passes 16-bit PCM as `u16`; the bits are libopus's `opus_int16`.
+/// Bit-for-bit copies, since this crate allows no `unsafe` to reinterpret.
+fn to_opus_pcm(pcm: &[i16]) -> Vec<u16> {
+    pcm.iter()
+        .map(|s| u16::from_ne_bytes(s.to_ne_bytes()))
+        .collect()
+}
+
+fn from_opus_pcm(pcm: &[u16]) -> impl Iterator<Item = i16> + '_ {
+    pcm.iter().map(|s| i16::from_ne_bytes(s.to_ne_bytes()))
+}
+
 /// Opus encoder: 48 kHz mono in, Opus packets out.
 pub struct OpusEncoder {
-    encoder: audiopus::coder::Encoder,
+    encoder: opusic_c::Encoder,
 }
 
 impl OpusEncoder {
     /// Create a new Opus encoder.
     pub fn new() -> Result<Self> {
-        let mut encoder = audiopus::coder::Encoder::new(
-            audiopus::SampleRate::Hz48000,
-            audiopus::Channels::Mono,
-            audiopus::Application::Voip,
+        let mut encoder = opusic_c::Encoder::new(
+            opusic_c::Channels::Mono,
+            opusic_c::SampleRate::Hz48000,
+            opusic_c::Application::Voip,
         )
-        .map_err(|e| Error::codec(format!("Opus encoder init: {}", e)))?;
+        .map_err(|e| Error::codec(format!("Opus encoder init: {:?}", e)))?;
 
         encoder
-            .set_bitrate(audiopus::Bitrate::BitsPerSecond(BITRATE_BPS))
-            .map_err(|e| Error::codec(format!("Opus set bitrate: {}", e)))?;
+            .set_bitrate(opusic_c::Bitrate::Value(BITRATE_BPS))
+            .map_err(|e| Error::codec(format!("Opus set bitrate: {:?}", e)))?;
         encoder
-            .set_signal(audiopus::Signal::Voice)
-            .map_err(|e| Error::codec(format!("Opus set signal: {}", e)))?;
+            .set_signal(opusic_c::Signal::Voice)
+            .map_err(|e| Error::codec(format!("Opus set signal: {:?}", e)))?;
         encoder
-            .set_inband_fec(true)
-            .map_err(|e| Error::codec(format!("Opus set FEC: {}", e)))?;
+            .set_inband_fec(opusic_c::InbandFec::Mode1)
+            .map_err(|e| Error::codec(format!("Opus set FEC: {:?}", e)))?;
         encoder
-            .set_packet_loss_perc(EXPECTED_LOSS_PERCENT)
-            .map_err(|e| Error::codec(format!("Opus set loss: {}", e)))?;
+            .set_packet_loss(EXPECTED_LOSS_PERCENT)
+            .map_err(|e| Error::codec(format!("Opus set loss: {:?}", e)))?;
 
         Ok(Self { encoder })
     }
@@ -82,13 +99,16 @@ impl AudioEncoder for OpusEncoder {
         }
 
         let mut encoded = [0u8; 4000];
-        match self.encoder.encode(pcm, &mut encoded) {
+        match self
+            .encoder
+            .encode_to_slice(&to_opus_pcm(pcm), &mut encoded)
+        {
             Ok(len) => {
                 output.extend_from_slice(&encoded[..len]);
                 pcm.len()
             }
             Err(e) => {
-                log::error!("Opus encode error: {}", e);
+                log::error!("Opus encode error: {:?}", e);
                 0
             }
         }
@@ -114,15 +134,15 @@ impl std::fmt::Debug for OpusEncoder {
 
 /// Opus decoder: Opus packets in, 48 kHz mono PCM out.
 pub struct OpusDecoder {
-    decoder: audiopus::coder::Decoder,
+    decoder: opusic_c::Decoder,
 }
 
 impl OpusDecoder {
     /// Create a new Opus decoder.
     pub fn new() -> Result<Self> {
         let decoder =
-            audiopus::coder::Decoder::new(audiopus::SampleRate::Hz48000, audiopus::Channels::Mono)
-                .map_err(|e| Error::codec(format!("Opus decoder init: {}", e)))?;
+            opusic_c::Decoder::new(opusic_c::Channels::Mono, opusic_c::SampleRate::Hz48000)
+                .map_err(|e| Error::codec(format!("Opus decoder init: {:?}", e)))?;
 
         Ok(Self { decoder })
     }
@@ -134,30 +154,17 @@ impl OpusDecoder {
     /// packet *after* the lost one and libopus decodes the redundant copy of
     /// the lost frame that it carries, falling back to PLC if there is none.
     fn run(&mut self, packet: Option<&[u8]>, frame: usize, fec: bool, output: &mut Vec<i16>) {
-        let mut decoded = [0i16; MAX_DECODED_SAMPLES];
+        let mut decoded = [0u16; MAX_DECODED_SAMPLES];
         let frame = frame.min(MAX_DECODED_SAMPLES);
+        // An empty packet is a lost one to libopus: it conceals `frame` samples.
+        let packet = packet.unwrap_or(&[]);
 
-        let packet: Option<audiopus::packet::Packet<'_>> = match packet {
-            Some(bytes) => match bytes.try_into() {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    log::error!("Opus packet error: {}", e);
-                    return;
-                }
-            },
-            None => None,
-        };
-        let out_signals: audiopus::MutSignals<'_, _> = match (&mut decoded[..frame]).try_into() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("Opus signals error: {}", e);
-                return;
-            }
-        };
-
-        match self.decoder.decode(packet, out_signals, fec) {
-            Ok(samples) => output.extend_from_slice(&decoded[..samples]),
-            Err(e) => log::error!("Opus decode error: {}", e),
+        match self
+            .decoder
+            .decode_to_slice(packet, &mut decoded[..frame], fec)
+        {
+            Ok(samples) => output.extend(from_opus_pcm(&decoded[..samples])),
+            Err(e) => log::error!("Opus decode error: {:?}", e),
         }
     }
 }
@@ -205,6 +212,13 @@ mod tests {
                 (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 16000.0) as i16
             })
             .collect()
+    }
+
+    /// libopus is the bundled 1.6 build, not whatever a system package had.
+    #[test]
+    fn libopus_is_1_6() {
+        let v = opusic_c::version();
+        assert!(v.contains("1.6"), "libopus {v}");
     }
 
     #[test]
