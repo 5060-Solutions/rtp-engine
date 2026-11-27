@@ -13,6 +13,7 @@ use crate::codec::CodecType;
 #[cfg(feature = "device")]
 use crate::codec::{AudioDecoder, AudioEncoder, create_decoder, create_encoder};
 use crate::error::{Error, Result};
+use crate::ports::RtpSockets;
 use crate::recorder::{CallRecorder, RecorderHandle};
 #[cfg(feature = "device")]
 use crate::resample::{StreamResampler, f32_to_i16, i16_to_f32, resample_linear};
@@ -105,39 +106,11 @@ impl MediaSession {
     /// let session = MediaSession::start(rtp_port, remote, codec).await?;
     /// ```
     pub async fn allocate_port() -> Result<u16> {
-        // Bind RTP socket to port 0 to get OS-assigned port
-        let rtp_socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| Error::Network(e))?;
-
-        let rtp_port = rtp_socket
-            .local_addr()
-            .map_err(|e| Error::Network(e))?
-            .port();
-
-        // Make sure port is even (RTP convention) - if odd, try again
-        if rtp_port % 2 != 0 {
-            drop(rtp_socket);
-            return Box::pin(Self::allocate_port()).await;
-        }
-
-        // Try to bind RTCP port (RTP + 1) to verify it's available
-        let rtcp_port = rtp_port + 1;
-        let rtcp_socket = UdpSocket::bind(format!("0.0.0.0:{}", rtcp_port)).await;
-
-        if rtcp_socket.is_err() {
-            // RTCP port not available, try again
-            drop(rtp_socket);
-            return Box::pin(Self::allocate_port()).await;
-        }
-
-        // Both ports verified available - drop sockets and return the port
-        // The port will be re-bound when start() is called
-        // Note: There's a small race window here, but it's acceptable
-        drop(rtcp_socket);
-        drop(rtp_socket);
-
-        Ok(rtp_port)
+        // The sockets are dropped here, so the port is free again until
+        // `start()` binds it: anything else can take it in between. Prefer
+        // `RtpSockets::allocate()` and the `start_on_sockets*` functions,
+        // which hold the port the whole time.
+        Ok(RtpSockets::allocate().await?.port())
     }
 
     /// Start a media session with the specified codec.
@@ -288,8 +261,98 @@ impl MediaSession {
         .await
     }
 
+    /// Start a media session on sockets already bound, taking them over.
+    ///
+    /// For a port named in an SDP before the session starts: allocate it with
+    /// [`RtpSockets::allocate`], put [`RtpSockets::port`] in the SDP, and start
+    /// here. The port is never released in between, so nothing else can take
+    /// it, as it can between [`MediaSession::allocate_port`] and
+    /// [`MediaSession::start`].
+    ///
+    /// Not `async`, as the port-number functions are: nothing is left to
+    /// bind. It must still run inside a Tokio runtime (the sockets already
+    /// belong to one), since the session spawns its RTP and RTCP tasks there.
+    pub fn start_on_sockets(
+        sockets: RtpSockets,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+    ) -> Result<Self> {
+        Self::start_on_sockets_with_devices(sockets, remote_addr, codec_type, None, None)
+    }
+
+    /// [`MediaSession::start_on_sockets`] with specific audio devices, as
+    /// [`MediaSession::start_with_devices`].
+    pub fn start_on_sockets_with_devices(
+        sockets: RtpSockets,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<Self> {
+        Self::start_on(
+            sockets,
+            remote_addr,
+            codec_type,
+            None,
+            None,
+            input_device,
+            output_device,
+            crate::audio_proc::default_config(),
+        )
+    }
+
+    /// [`MediaSession::start_on_sockets`] with SRTP and specific audio
+    /// devices, as [`MediaSession::start_with_srtp_keys_and_devices`].
+    #[cfg(feature = "srtp")]
+    pub fn start_on_sockets_with_srtp_keys_and_devices(
+        sockets: RtpSockets,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        tx_srtp_ctx: SrtpContext,
+        rx_srtp_ctx: SrtpContext,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<Self> {
+        Self::start_on(
+            sockets,
+            remote_addr,
+            codec_type,
+            Some(tx_srtp_ctx),
+            Some(rx_srtp_ctx),
+            input_device,
+            output_device,
+            crate::audio_proc::default_config(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn start_internal(
         local_rtp_port: u16,
+        remote_addr: SocketAddr,
+        codec_type: CodecType,
+        tx_srtp_ctx: Option<SrtpContext>,
+        rx_srtp_ctx: Option<SrtpContext>,
+        input_device_name: Option<String>,
+        output_device_name: Option<String>,
+        voice_config: crate::audio_proc::VoiceProcessorConfig,
+    ) -> Result<Self> {
+        let sockets = RtpSockets::bind(local_rtp_port).await?;
+        Self::start_on(
+            sockets,
+            remote_addr,
+            codec_type,
+            tx_srtp_ctx,
+            rx_srtp_ctx,
+            input_device_name,
+            output_device_name,
+            voice_config,
+        )
+    }
+
+    /// Must run inside a Tokio runtime: the RTP and RTCP tasks are spawned on it.
+    #[allow(clippy::too_many_arguments)]
+    fn start_on(
+        sockets: RtpSockets,
         remote_addr: SocketAddr,
         codec_type: CodecType,
         #[allow(unused_variables)] tx_srtp_ctx: Option<SrtpContext>,
@@ -298,10 +361,8 @@ impl MediaSession {
         #[allow(unused_variables)] output_device_name: Option<String>,
         voice_config: crate::audio_proc::VoiceProcessorConfig,
     ) -> Result<Self> {
-        let rtp_socket = UdpSocket::bind(format!("0.0.0.0:{}", local_rtp_port))
-            .await
-            .map_err(|e| Error::Network(e))?;
-
+        let local_rtp_port = sockets.port();
+        let (rtp_socket, rtcp_socket) = sockets.into_parts();
         let rtp_socket = Arc::new(rtp_socket);
         let muted = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
@@ -357,11 +418,7 @@ impl MediaSession {
         #[cfg(not(feature = "srtp"))]
         let (tx_srtp, rx_srtp): (Option<SharedSrtp>, Option<SharedSrtp>) = (None, None);
 
-        // RTCP socket (RTP port + 1)
-        let rtcp_port = local_rtp_port + 1;
-        let rtcp_socket = UdpSocket::bind(format!("0.0.0.0:{}", rtcp_port))
-            .await
-            .map_err(|e| Error::Network(e))?;
+        // RTCP socket (RTP port + 1), bound with the RTP one
         let rtcp_socket = Arc::new(rtcp_socket);
         let remote_rtcp_addr: SocketAddr =
             format!("{}:{}", remote_addr.ip(), remote_addr.port() + 1)
