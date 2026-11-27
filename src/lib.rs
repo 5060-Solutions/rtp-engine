@@ -57,6 +57,7 @@ pub mod audio_proc;
 pub mod codec;
 pub mod error;
 pub mod jitter;
+pub mod ports;
 pub mod rtp;
 pub mod stun;
 
@@ -82,6 +83,7 @@ mod session;
 pub use codec::CodecType;
 pub use error::{Error, Result};
 pub use jitter::{JitterBuffer, JitterConfig, JitterMode, JitterStats};
+pub use ports::RtpSockets;
 pub use recorder::{CallRecorder, RecorderHandle, generate_recording_filename};
 pub use resample::{f32_to_i16, i16_to_f32, resample_linear, resample_linear_i16};
 pub use rtp::RtpStats;
